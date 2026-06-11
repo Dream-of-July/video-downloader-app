@@ -17,13 +17,28 @@ struct VideoDownloaderApp: App {
     }
 }
 
-/// 下载中关窗 / 退出前的确认弹窗。返回 true 表示用户选择中止下载。
+/// 关窗 / 退出确认文案：按流水线阶段区分；非进行中阶段返回 nil（无需确认）。
 @MainActor
-private func confirmAbortDownload() -> Bool {
+private func abortConfirmationMessage(for model: ViewModel) -> String? {
+    switch model.stage {
+    case .downloading:
+        return "正在下载，关闭窗口会中止下载。"
+    case .translating:
+        return "正在翻译字幕，关闭会丢弃已完成的翻译进度。"
+    case .burning:
+        return "正在烧录字幕，关闭会中止烧录（视频已下载，不受影响）。"
+    default:
+        return nil
+    }
+}
+
+/// 关窗 / 退出前的确认弹窗。返回 true 表示用户选择中止。
+@MainActor
+private func confirmAbortDownload(message: String) -> Bool {
     let alert = NSAlert()
-    alert.messageText = "正在下载，关闭窗口会中止下载。"
+    alert.messageText = message
     alert.alertStyle = .warning
-    alert.addButton(withTitle: "继续下载")
+    alert.addButton(withTitle: "继续")
     alert.addButton(withTitle: "中止并关闭")
     return alert.runModal() == .alertSecondButtonReturn
 }
@@ -57,8 +72,8 @@ struct WindowAccessor: NSViewRepresentable {
         init(model: ViewModel) { self.model = model }
 
         func windowShouldClose(_ sender: NSWindow) -> Bool {
-            guard model.isDownloadingStage else { return true }
-            guard confirmAbortDownload() else { return false }
+            guard let message = abortConfirmationMessage(for: model) else { return true }
+            guard confirmAbortDownload(message: message) else { return false }
             model.cancelDownload()
             return true
         }
@@ -70,8 +85,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: ViewModel?
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model, model.isDownloadingStage else { return .terminateNow }
-        guard confirmAbortDownload() else { return .terminateCancel }
+        guard let model, let message = abortConfirmationMessage(for: model) else { return .terminateNow }
+        guard confirmAbortDownload(message: message) else { return .terminateCancel }
         model.cancelDownload()
         return .terminateNow
     }

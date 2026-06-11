@@ -16,13 +16,18 @@ struct LoginSheet: View {
 
     @State private var currentURL: String = ""
     @State private var errorText: String?
+    @State private var loadErrorText: String?
     @State private var isExporting = false
 
     var body: some View {
         VStack(spacing: 0) {
             topBar
             Divider()
-            LoginWebView(startURL: Self.startURL(for: site), currentURL: $currentURL)
+            LoginWebView(
+                startURL: Self.startURL(for: site),
+                currentURL: $currentURL,
+                loadError: $loadErrorText
+            )
         }
         .frame(width: 920, height: 640)
     }
@@ -32,17 +37,20 @@ struct LoginSheet: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("登录 \(siteDisplayName)")
                     .font(.headline)
+                Text("在下方页面完成登录，然后点右上角「完成登录」")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 if !currentURL.isEmpty {
                     Text(currentURL)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
             }
             Spacer(minLength: 12)
-            if let errorText {
-                Text(errorText)
+            if let displayError = errorText ?? loadErrorText {
+                Text(displayError)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .lineLimit(2)
@@ -112,37 +120,79 @@ struct LoginSheet: View {
 struct LoginWebView: NSViewRepresentable {
     let startURL: URL
     @Binding var currentURL: String
+    @Binding var loadError: String?
+
+    /// 桌面 Safari 的 UA：降低 Google 等站点对内嵌 WebView 的拦截概率。
+    private static let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(currentURL: $currentURL)
+        Coordinator(currentURL: $currentURL, loadError: $loadError)
     }
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.customUserAgent = Self.safariUserAgent
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.load(URLRequest(url: startURL))
         return webView
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
         context.coordinator.currentURL = $currentURL
+        context.coordinator.loadError = $loadError
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         var currentURL: Binding<String>
+        var loadError: Binding<String?>
 
-        init(currentURL: Binding<String>) {
+        init(currentURL: Binding<String>, loadError: Binding<String?>) {
             self.currentURL = currentURL
+            self.loadError = loadError
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
             currentURL.wrappedValue = webView.url?.absoluteString ?? ""
+            loadError.wrappedValue = nil
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             currentURL.wrappedValue = webView.url?.absoluteString ?? ""
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didFailProvisionalNavigation navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            reportLoadFailure(error)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            reportLoadFailure(error)
+        }
+
+        /// 登录流程的重定向会频繁打断在途请求（NSURLErrorCancelled），不算失败。
+        private func reportLoadFailure(_ error: Error) {
+            guard (error as NSError).code != NSURLErrorCancelled else { return }
+            loadError.wrappedValue = "页面加载失败，请检查网络后重试"
+        }
+
+        /// 弹窗 / target=_blank：直接在当前 webView 里打开，不创建新窗口。
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            if let url = navigationAction.request.url {
+                webView.load(URLRequest(url: url))
+            }
+            return nil
         }
     }
 }

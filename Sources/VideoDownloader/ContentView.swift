@@ -397,6 +397,11 @@ struct ContentView: View {
                     .buttonStyle(.link)
                     .font(.caption)
                 }
+            } else if model.chineseMode != .off, model.selectedSubtitleIDs.count > 1,
+                      let source = model.translationSourceSubtitle(in: info) {
+                Text("将翻译：\(source.label)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(12)
@@ -506,6 +511,9 @@ struct ContentView: View {
                 Text(label)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text("视频较长时需要几分钟…")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
         }
         .padding(12)
@@ -553,6 +561,12 @@ struct ContentView: View {
                         model.revealInFinder()
                     }
                     .buttonStyle(.borderedProminent)
+                    if model.canRetryPostProcess {
+                        Button("重试字幕处理") {
+                            model.retryPostProcess()
+                        }
+                        .buttonStyle(.bordered)
+                    }
                     Button("下载新视频") {
                         model.reset()
                         urlFieldFocused = true

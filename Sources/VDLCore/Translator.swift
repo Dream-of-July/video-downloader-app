@@ -74,19 +74,29 @@ func serializeSRT(_ cues: [SubtitleCue]) -> String {
 
 // MARK: - Anthropic Messages API 请求
 
-/// 调一次 Messages API，返回回复里第一个 type=="text" 块的文本。
+/// Messages API 一次调用的结果：text 块拼接后的文本 + stop_reason。
+struct AnthropicReply {
+    let text: String
+    let stopReason: String?
+}
+
+/// 调一次 Messages API，返回回复里所有 type=="text" 块拼接的文本与 stop_reason。
 /// 429/5xx 指数退避重试最多 2 次（2s、8s）；其余错误映射为 VDLError。
 func sendAnthropicMessage(
     settings: AppSettings,
     system: String?,
     userContent: String,
     maxTokens: Int
-) async throws -> String {
+) async throws -> AnthropicReply {
     let model = settings.translationModel.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !model.isEmpty else {
         throw VDLError.translateFailed("尚未配置模型，请在设置里填写模型名称。")
     }
-    let token = settings.translationAuthToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    var token = settings.translationAuthToken.trimmingCharacters(in: .whitespacesAndNewlines)
+    // 用户误把 "Bearer xxx" 整段贴进凭证框时剥掉前缀，避免双重 Bearer。
+    if token.lowercased().hasPrefix("bearer ") {
+        token = String(token.dropFirst("bearer ".count)).trimmingCharacters(in: .whitespaces)
+    }
     guard !token.isEmpty else {
         throw VDLError.translateFailed("尚未配置 API 凭证，请在设置里填写。")
     }
@@ -148,12 +158,14 @@ func sendAnthropicMessage(
                 }
                 struct Reply: Decodable {
                     let content: [Block]
+                    let stop_reason: String?
                 }
                 guard let reply = try? JSONDecoder().decode(Reply.self, from: data),
-                      let text = reply.content.first(where: { $0.type == "text" })?.text else {
+                      reply.content.contains(where: { $0.type == "text" }) else {
                     throw VDLError.translateFailed("服务响应不符合 Anthropic Messages 协议，请检查服务地址。")
                 }
-                return text
+                let text = reply.content.filter { $0.type == "text" }.compactMap(\.text).joined()
+                return AnthropicReply(text: text, stopReason: reply.stop_reason)
             }
             let retryable = http.statusCode == 429 || (500...599).contains(http.statusCode)
             if retryable, attempt < backoffNanoseconds.count {
@@ -190,13 +202,13 @@ func sendAnthropicMessage(
 
 /// 设置面板「测试连接」：发一条迷你请求，返回模型回复文本。
 public func testTranslationConnection(settings: AppSettings) async throws -> String {
-    let text = try await sendAnthropicMessage(
+    let reply = try await sendAnthropicMessage(
         settings: settings,
         system: nil,
         userContent: "请只回复两个字：正常",
         maxTokens: 16
     )
-    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return reply.text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 // MARK: - AnthropicTranslator
@@ -241,17 +253,7 @@ public struct AnthropicTranslator: SubtitleTranslator {
             if Task.isCancelled { throw VDLError.cancelled }
             let upper = min(position + Self.chunkSize, cues.count)
             let chunk = cues[position..<upper]
-            let userContent = chunk.enumerated().map { offset, cue in
-                "\(position + offset + 1)|\(Self.flattened(cue.text))"
-            }.joined(separator: "\n")
-
-            let reply = try await sendAnthropicMessage(
-                settings: settings,
-                system: Self.systemPrompt,
-                userContent: userContent,
-                maxTokens: 8000
-            )
-            let translated = Self.parseReply(reply)
+            let translated = try await translateChunk(chunk, startNumber: position + 1, depth: 0)
             for offset in 0..<chunk.count {
                 let cueIndex = position + offset
                 // 某条缺失就保留原文（output 初始即原文）
@@ -278,6 +280,52 @@ public struct AnthropicTranslator: SubtitleTranslator {
             throw VDLError.translateFailed("无法写入译文文件：\(error.localizedDescription)")
         }
         return outputURL
+    }
+
+    /// 翻译一块字幕，返回 [全局编号: 译文]。
+    /// stop_reason 为 "max_tokens"（译文被截断）时按减半的条数自动重试：
+    /// 最多再分两层、每块最小 8 条；仍截断则抛错。
+    /// 译文缺失行数超过 40% 视为模型返回格式异常，抛错而不是静默保留原文。
+    private func translateChunk(
+        _ chunk: ArraySlice<SubtitleCue>,
+        startNumber: Int,
+        depth: Int
+    ) async throws -> [Int: String] {
+        if Task.isCancelled { throw VDLError.cancelled }
+        let userContent = chunk.enumerated().map { offset, cue in
+            "\(startNumber + offset)|\(Self.flattened(cue.text))"
+        }.joined(separator: "\n")
+
+        let reply = try await sendAnthropicMessage(
+            settings: settings,
+            system: Self.systemPrompt,
+            userContent: userContent,
+            maxTokens: 8000
+        )
+        if reply.stopReason == "max_tokens" {
+            let half = chunk.count / 2
+            guard depth < 2, half >= 8 else {
+                throw VDLError.translateFailed("译文超出模型输出上限，请减小每块字幕条数或检查模型 max_tokens 限制")
+            }
+            let mid = chunk.startIndex + half
+            var merged = try await translateChunk(
+                chunk[chunk.startIndex..<mid], startNumber: startNumber, depth: depth + 1
+            )
+            let second = try await translateChunk(
+                chunk[mid..<chunk.endIndex], startNumber: startNumber + half, depth: depth + 1
+            )
+            merged.merge(second) { _, new in new }
+            return merged
+        }
+
+        let map = Self.parseReply(reply.text)
+        let missing = (startNumber..<startNumber + chunk.count)
+            .filter { (map[$0] ?? "").isEmpty }
+            .count
+        if Double(missing) > Double(chunk.count) * 0.4 {
+            throw VDLError.translateFailed("模型返回格式异常，缺失过多译文行")
+        }
+        return map
     }
 
     /// 字幕条内部换行折叠成 " / "，保证一条占一行。

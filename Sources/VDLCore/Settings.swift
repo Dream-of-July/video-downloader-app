@@ -57,8 +57,14 @@ public struct AppSettings: Codable, Sendable, Equatable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(self)
         let url = Self.settingsFileURL
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        // 一步创建并带 0600 权限，避免「先 0644 落盘再收紧」的窗口（文件含凭证）
+        guard FileManager.default.createFile(
+            atPath: url.path, contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            try? FileManager.default.removeItem(at: url)
+            throw CocoaError(.fileWriteUnknown)
+        }
     }
 
     /// 翻译功能是否已配置完整

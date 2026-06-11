@@ -59,6 +59,8 @@ final class ViewModel: ObservableObject {
     @Published var failedNeedsLogin: String?
     /// done 页的一行灰字提示（如「没有字幕文件，已跳过翻译」）
     @Published var doneNotice: String?
+    /// 翻译 / 烧录失败或取消后为 true：done 页显示「重试字幕处理」
+    @Published var canRetryPostProcess = false
     /// 设置窗里的提示（保存失败 / 请先配置翻译服务）
     @Published var settingsNotice: String?
 
@@ -70,6 +72,15 @@ final class ViewModel: ObservableObject {
     private var retryAction: (@MainActor () -> Void)?
     /// 设置窗里点了「登录 ××」：先收起设置 sheet，再由其 onDismiss 弹出登录窗
     private var pendingLoginSite: String?
+    /// 部分成功建模：下载已成功的中间产物，翻译 / 烧录失败后据此重试，绝不重新下载
+    private var downloadedInfo: VideoInfo?
+    private var downloadedResult: DownloadResult?
+    /// 选定的翻译源字幕
+    private var sourceSrtURL: URL?
+    /// 翻译完成的中文字幕；重试烧录时不再调 LLM
+    private var zhSrtURL: URL?
+    /// 本次流水线的中文字幕模式（重试字幕处理沿用它）
+    private var postProcessMode: ChineseSubtitleMode = .off
     /// 本次流水线烧录出的视频；revealInFinder 优先选中它
     private var burnedVideoURL: URL?
     /// 代际令牌：reset / 取消后，旧任务的回调全部作废
@@ -241,6 +252,11 @@ final class ViewModel: ObservableObject {
         retryAction = nil
         failedNeedsLogin = nil
         doneNotice = nil
+        canRetryPostProcess = false
+        downloadedInfo = nil
+        downloadedResult = nil
+        sourceSrtURL = nil
+        zhSrtURL = nil
         burnedVideoURL = nil
         stage = .downloading(info)
         lastProgressPhase = .preparing
@@ -248,71 +264,17 @@ final class ViewModel: ObservableObject {
         progress = DownloadProgress(phase: .preparing)
         pipelineProgress = nil
         let mode = chineseMode
+        postProcessMode = mode
+        let preferredSubtitleLang = request.subtitleLangs.first ?? request.autoSubtitleLangs.first
         downloadTask = Task {
+            let result: DownloadResult
             do {
-                let result = try await self.engine.download(request) { [weak self] p in
+                result = try await self.engine.download(request) { [weak self] p in
                     Task { @MainActor in
                         guard let self, self.session == token else { return }
                         self.applyProgress(p)
                     }
                 }
-                guard token == self.session, !Task.isCancelled else { return }
-                self.progress = nil
-                guard mode != .off else {
-                    self.downloadTask = nil
-                    self.stage = .done(info, result)
-                    return
-                }
-
-                // 1. 找字幕文件；没有就跳过翻译直接完成
-                guard let srtFile = result.files.first(where: { $0.pathExtension.lowercased() == "srt" }) else {
-                    self.downloadTask = nil
-                    self.doneNotice = "没有字幕文件，已跳过翻译"
-                    self.stage = .done(info, result)
-                    return
-                }
-
-                // 2. 翻译
-                self.stage = .translating(info)
-                self.pipelineProgress = 0
-                let translator = makeTranslator(settings: self.settings)
-                let zhSrt = try await translator.translate(
-                    srtFile: srtFile,
-                    style: self.settings.subtitleStyle
-                ) { [weak self] p in
-                    Task { @MainActor in
-                        guard let self, self.session == token else { return }
-                        self.pipelineProgress = p
-                    }
-                }
-                guard token == self.session, !Task.isCancelled else { return }
-                var files = result.files + [zhSrt]
-
-                // 3. 烧录（仅 burnIn）
-                if mode == .burnIn {
-                    if let video = result.files.first(where: {
-                        Self.videoExtensions.contains($0.pathExtension.lowercased())
-                    }) {
-                        self.stage = .burning(info)
-                        self.pipelineProgress = 0
-                        let burner = makeBurner()
-                        let burned = try await burner.burn(video: video, subtitle: zhSrt) { [weak self] p in
-                            Task { @MainActor in
-                                guard let self, self.session == token else { return }
-                                self.pipelineProgress = p
-                            }
-                        }
-                        guard token == self.session, !Task.isCancelled else { return }
-                        files.insert(burned, at: 0)
-                        self.burnedVideoURL = burned
-                    } else {
-                        self.doneNotice = "没有找到视频文件，已跳过烧录"
-                    }
-                }
-
-                self.downloadTask = nil
-                self.pipelineProgress = nil
-                self.stage = .done(info, DownloadResult(files: files))
             } catch {
                 guard token == self.session, !Task.isCancelled else { return }
                 self.downloadTask = nil
@@ -323,25 +285,184 @@ final class ViewModel: ObservableObject {
                     return
                 }
                 self.fail(error) { [weak self] in self?.performDownload(info) }
+                return
             }
+            guard token == self.session, !Task.isCancelled else { return }
+            self.progress = nil
+            self.downloadedInfo = info
+            self.downloadedResult = result
+            guard mode != .off else {
+                self.downloadTask = nil
+                self.stage = .done(info, result)
+                return
+            }
+
+            // 找翻译源字幕（按勾选语言匹配）；没有就跳过翻译直接完成
+            guard let srtFile = Self.pickSourceSubtitle(from: result.files, preferredLang: preferredSubtitleLang) else {
+                self.downloadTask = nil
+                self.doneNotice = "没有字幕文件，已跳过翻译"
+                self.stage = .done(info, result)
+                return
+            }
+            self.sourceSrtURL = srtFile
+            await self.runPostProcess(info: info, token: token, mode: mode)
         }
     }
 
-    /// 下载 / 翻译 / 烧录任一阶段都可取消，统一回到 ready。
-    func cancelDownload() {
-        let info: VideoInfo
-        switch stage {
-        case .downloading(let i), .translating(let i), .burning(let i):
-            info = i
-        default:
-            return
+    /// 翻译（zhSrtURL 已存在时跳过）+ 按模式烧录。
+    /// 失败 / 取消都不丢已下载的视频：落到 .done 并允许「重试字幕处理」。
+    private func runPostProcess(info: VideoInfo, token: Int, mode: ChineseSubtitleMode) async {
+        // 1. 翻译（重试烧录时已有译文，不再调 LLM）
+        if zhSrtURL == nil {
+            guard let srtFile = sourceSrtURL else {
+                settleDone(info: info, notice: "没有字幕文件，已跳过翻译", canRetry: false)
+                return
+            }
+            stage = .translating(info)
+            pipelineProgress = nil
+            let translator = makeTranslator(settings: settings)
+            do {
+                let zhSrt = try await translator.translate(
+                    srtFile: srtFile,
+                    style: settings.subtitleStyle
+                ) { [weak self] p in
+                    Task { @MainActor in
+                        guard let self, self.session == token else { return }
+                        self.pipelineProgress = p
+                    }
+                }
+                guard token == self.session, !Task.isCancelled else { return }
+                zhSrtURL = zhSrt
+            } catch {
+                guard token == self.session, !Task.isCancelled else { return }
+                settleDone(
+                    info: info,
+                    notice: "视频已下载，但字幕翻译失败：\(Self.shortReason(of: error))",
+                    canRetry: true
+                )
+                return
+            }
         }
+
+        // 2. 烧录（仅 burnIn；已有烧录产物时跳过）
+        if mode == .burnIn, burnedVideoURL == nil {
+            if let video = downloadedResult?.files.first(where: {
+                Self.videoExtensions.contains($0.pathExtension.lowercased())
+            }), let zhSrt = zhSrtURL {
+                stage = .burning(info)
+                pipelineProgress = nil
+                let burner = makeBurner()
+                do {
+                    let burned = try await burner.burn(video: video, subtitle: zhSrt) { [weak self] p in
+                        Task { @MainActor in
+                            guard let self, self.session == token else { return }
+                            self.pipelineProgress = p
+                        }
+                    }
+                    guard token == self.session, !Task.isCancelled else { return }
+                    burnedVideoURL = burned
+                } catch {
+                    guard token == self.session, !Task.isCancelled else { return }
+                    settleDone(
+                        info: info,
+                        notice: "视频已下载，但字幕烧录失败：\(Self.shortReason(of: error))",
+                        canRetry: true
+                    )
+                    return
+                }
+            } else {
+                settleDone(info: info, notice: "没有找到视频文件，已跳过烧录", canRetry: false)
+                return
+            }
+        }
+
+        settleDone(info: info, notice: nil, canRetry: false)
+    }
+
+    /// done 页「重试字幕处理」：从已有中间产物续跑，绝不重新下载、不重复翻译已成功的部分。
+    func retryPostProcess() {
+        guard case .done = stage, canRetryPostProcess,
+              let info = downloadedInfo, downloadedResult != nil else { return }
         session += 1
-        downloadTask?.cancel()
+        let token = session
+        canRetryPostProcess = false
+        doneNotice = nil
+        let mode = postProcessMode
+        downloadTask = Task {
+            await self.runPostProcess(info: info, token: token, mode: mode)
+        }
+    }
+
+    /// 统一落到 .done：文件列表由中间产物拼出（烧录视频排第一）。
+    private func settleDone(info: VideoInfo, notice: String?, canRetry: Bool) {
         downloadTask = nil
         progress = nil
         pipelineProgress = nil
-        stage = .ready(info)
+        doneNotice = notice
+        canRetryPostProcess = canRetry
+        stage = .done(info, DownloadResult(files: composedDoneFiles()))
+    }
+
+    /// 当前 done 页应展示的文件：下载产物 + 译文 + 烧录视频（排第一）。
+    private func composedDoneFiles() -> [URL] {
+        var files = downloadedResult?.files ?? []
+        if let zhSrt = zhSrtURL, !files.contains(zhSrt) { files.append(zhSrt) }
+        if let burned = burnedVideoURL {
+            files.removeAll { $0 == burned }
+            files.insert(burned, at: 0)
+        }
+        return files
+    }
+
+    /// 按用户勾选的语言挑翻译源字幕（文件名形如 "标题 [id].en-US.srt"）。
+    /// lang 大小写不敏感、允许前缀匹配（en 匹配 en-US）；匹配不到回退第一个 .srt。
+    private static func pickSourceSubtitle(from files: [URL], preferredLang: String?) -> URL? {
+        let srtFiles = files.filter { $0.pathExtension.lowercased() == "srt" }
+        guard let lang = preferredLang?.lowercased(), !lang.isEmpty else { return srtFiles.first }
+        func langCode(of file: URL) -> String? {
+            let stem = file.deletingPathExtension().lastPathComponent
+            guard let dotIndex = stem.lastIndex(of: ".") else { return nil }
+            return String(stem[stem.index(after: dotIndex)...]).lowercased()
+        }
+        if let matched = srtFiles.first(where: { file in
+            guard let code = langCode(of: file) else { return false }
+            return code == lang || code.hasPrefix(lang + "-") || lang.hasPrefix(code + "-")
+        }) {
+            return matched
+        }
+        return srtFiles.first
+    }
+
+    /// ready 页提示用：勾选多条字幕时实际作为翻译源的那条（真实字幕优先、按解析顺序取第一条）。
+    func translationSourceSubtitle(in info: VideoInfo) -> SubtitleChoice? {
+        let chosen = info.subtitles.filter { selectedSubtitleIDs.contains($0.id) }
+        return chosen.first(where: { !$0.isAuto }) ?? chosen.first
+    }
+
+    /// 去掉 VDLError 文案里的「字幕翻译失败：」「字幕烧录失败：」前缀，留短句给 doneNotice。
+    private static func shortReason(of error: Error) -> String {
+        if case VDLError.translateFailed(let reason) = error { return reason }
+        if case VDLError.burnFailed(let reason) = error { return reason }
+        return error.localizedDescription
+    }
+
+    /// 取消：下载阶段回到 ready；翻译 / 烧录阶段视频已保存，落到 done 并允许重试字幕处理。
+    func cancelDownload() {
+        switch stage {
+        case .downloading(let info):
+            session += 1
+            downloadTask?.cancel()
+            downloadTask = nil
+            progress = nil
+            pipelineProgress = nil
+            stage = .ready(info)
+        case .translating(let info), .burning(let info):
+            session += 1
+            downloadTask?.cancel()
+            settleDone(info: info, notice: "已取消字幕处理，视频已保存", canRetry: true)
+        default:
+            return
+        }
     }
 
     func backToList() {
@@ -383,6 +504,12 @@ final class ViewModel: ObservableObject {
         retryAction = nil
         failedNeedsLogin = nil
         doneNotice = nil
+        canRetryPostProcess = false
+        downloadedInfo = nil
+        downloadedResult = nil
+        sourceSrtURL = nil
+        zhSrtURL = nil
+        postProcessMode = .off
         burnedVideoURL = nil
         lastProgressPhase = nil
         lastProgressPercent = nil

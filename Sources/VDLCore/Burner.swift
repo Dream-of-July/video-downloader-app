@@ -53,12 +53,13 @@ public struct FFmpegBurner: SubtitleBurner {
         let filter = "subtitles=subs.srt:force_style="
             + "'FontName=PingFang SC,FontSize=15,Outline=1,Shadow=0,MarginV=20'"
         let head = ["-y", "-i", video.path, "-vf", filter]
-        let tail = [
-            "-c:a", "copy", "-movflags", "+faststart",
-            "-nostats", "-progress", "pipe:1", "out.mp4",
-        ]
-        let hardwareArgs = head + ["-c:v", "h264_videotoolbox", "-b:v", "\(bitrateK)k"] + tail
-        let softwareArgs = head + ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast"] + tail
+        func tail(audio: [String]) -> [String] {
+            audio + ["-movflags", "+faststart", "-nostats", "-progress", "pipe:1", "out.mp4"]
+        }
+        let copyAudio = ["-c:a", "copy"]
+        let aacAudio = ["-c:a", "aac", "-b:a", "192k"]
+        let hardwareVideo = ["-c:v", "h264_videotoolbox", "-b:v", "\(bitrateK)k"]
+        let softwareVideo = ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast"]
 
         // 4. 跑 ffmpeg，stdout 的 -progress 输出换算进度
         let totalSeconds = probe.duration
@@ -74,14 +75,27 @@ public struct FFmpegBurner: SubtitleBurner {
             }
         }
 
-        var (status, stderrTail) = try await run(hardwareArgs)
+        var videoCodecArgs = hardwareVideo
+        var (status, stderrTail) = try await run(head + videoCodecArgs + tail(audio: copyAudio))
 
-        // 5. videotoolbox 编码器初始化失败 → libx264 重试一次
+        // 5. videotoolbox 编码器初始化失败 → libx264 重试一次（判据收窄到硬编码自身的报错）
         if status != 0 {
             let lower = stderrTail.lowercased()
-            if lower.contains("videotoolbox") || lower.contains("encoder") {
+            if lower.contains("videotoolbox") || lower.contains("cannot create compression session") {
+                videoCodecArgs = softwareVideo
                 try? fm.removeItem(at: tempDir.appendingPathComponent("out.mp4"))
-                (status, stderrTail) = try await run(softwareArgs)
+                (status, stderrTail) = try await run(head + videoCodecArgs + tail(audio: copyAudio))
+            }
+        }
+        // 5b. 原音轨无法直接 copy 进 mp4 容器 → 转码 aac 重试一次
+        if status != 0 {
+            let lower = stderrTail.lowercased()
+            let audioCopyFailed = lower.contains("could not find tag")
+                || lower.contains("incompatible")
+                || lower.contains("codec not currently supported in container")
+            if audioCopyFailed {
+                try? fm.removeItem(at: tempDir.appendingPathComponent("out.mp4"))
+                (status, stderrTail) = try await run(head + videoCodecArgs + tail(audio: aacAudio))
             }
         }
         guard status == 0 else {

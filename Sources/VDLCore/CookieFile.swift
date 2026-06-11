@@ -38,12 +38,21 @@ public enum NetscapeCookieFile {
             ].joined(separator: "\t"))
         }
 
-        try FileManager.default.createDirectory(
+        let fm = FileManager.default
+        try fm.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true
         )
         let data = Data((lines.joined(separator: "\n") + "\n").utf8)
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        // createFile 带权限一步创建（覆盖旧文件），不存在先写 0644 再收紧的窗口期。
+        let created = fm.createFile(
+            atPath: url.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        )
+        guard created else {
+            try? fm.removeItem(at: url)
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: url.path])
+        }
     }
 
     /// 删除 cookies 文件（清除登录态）；文件不存在时静默忽略。

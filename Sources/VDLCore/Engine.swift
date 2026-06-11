@@ -254,14 +254,23 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         return ["--cookies", cookieFile.path]
     }
 
-    /// 识别"需要登录"类错误。命中返回 loginRequired，否则返回 nil 走常规文案。
+    /// 识别"需要登录"类错误。命中返回 loginRequired（或已登录时的过期文案），否则返回 nil 走常规文案。
     private static func detectLoginRequired(stderr: String, url urlString: String) -> VDLError? {
+        let hasCookies = FileManager.default.fileExists(atPath: AppSettings.cookieFileURL.path)
         if stderr.contains("Sign in to confirm") {
+            // 已登录过仍被风控：再弹登录窗没有意义，提示重新登录或稍后重试。
+            if hasCookies {
+                return .downloadFailed("YouTube 要求确认登录状态。登录信息可能已过期，可在设置里重新登录，或稍后重试。")
+            }
             return .loginRequired("youtube.com")
         }
         let host = (URL(string: urlString)?.host ?? "").lowercased()
         // YouTube 的 403 实质是 PO token / 未登录，登录 cookies 是正解；其他站点的 403 保持防盗链文案。
-        if isYouTubeHost(host), stderr.contains("HTTP Error 403") {
+        // 只看最后一条 ERROR 行，避免中间分片的瞬时 403 被误判成需要登录。
+        if isYouTubeHost(host), summarizeStderr(stderr).contains("HTTP Error 403") {
+            if hasCookies {
+                return .downloadFailed("YouTube 拒绝了请求（403）。登录信息可能已过期，可在设置里重新登录，或稍后重试。")
+            }
             return .loginRequired("youtube.com")
         }
         let pattern = "login required|need to log ?in|account cookies|members?[- ]only|大会员|请登录"
