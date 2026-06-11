@@ -7,6 +7,10 @@ public enum VDLError: LocalizedError, Sendable {
     case sniffFailed(String)
     case analyzeFailed(String)
     case downloadFailed(String)
+    /// 站点风控/会员限制，需要用户在 App 内登录该站点后重试。关联值为站点 host（如 "youtube.com"）。
+    case loginRequired(String)
+    case translateFailed(String)
+    case burnFailed(String)
     case cancelled
 
     public var errorDescription: String? {
@@ -19,6 +23,12 @@ public enum VDLError: LocalizedError, Sendable {
             return "解析视频信息失败：\(reason)"
         case .downloadFailed(let reason):
             return "下载失败：\(reason)"
+        case .loginRequired(let site):
+            return "\(site) 需要登录后才能下载。点击「去登录」，在弹出的页面里登录账号后重试。"
+        case .translateFailed(let reason):
+            return "字幕翻译失败：\(reason)"
+        case .burnFailed(let reason):
+            return "字幕烧录失败：\(reason)"
         case .cancelled:
             return "已取消"
         }
@@ -182,6 +192,58 @@ public struct DownloadResult: Sendable {
     public init(files: [URL]) {
         self.files = files
     }
+}
+
+// MARK: - 中文字幕（翻译与烧录）
+
+/// 烧录/输出字幕的样式
+public enum SubtitleStyle: String, Codable, Sendable {
+    /// 原文在上、中文在下
+    case bilingual
+    /// 仅中文
+    case chineseOnly
+}
+
+/// 一条 SRT 字幕
+public struct SubtitleCue: Sendable {
+    public let index: Int
+    /// SRT 原始时间戳，如 "00:01:02,500"
+    public let start: String
+    public let end: String
+    public var text: String
+
+    public init(index: Int, start: String, end: String, text: String) {
+        self.index = index
+        self.start = start
+        self.end = end
+        self.text = text
+    }
+}
+
+/// 字幕翻译器。默认实现 `AnthropicTranslator`（Translator.swift）：
+/// 通过 Anthropic Messages API 协议（POST {baseURL}/v1/messages）调用配置的模型，
+/// 兼容官方 API 与任何 Anthropic 协议网关。用 `makeTranslator(settings:)` 获取实例。
+public protocol SubtitleTranslator: Sendable {
+    /// 把 srt 文件翻译成中文，按 style 生成新 srt（双语：原文+中文同条；仅中文：替换原文），
+    /// 写到 srt 同目录、文件名加 ".zh" 后缀；progress 为 0...1。
+    /// 失败抛 VDLError.translateFailed；支持任务取消。
+    func translate(
+        srtFile: URL,
+        style: SubtitleStyle,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> URL
+}
+
+/// 字幕烧录器。默认实现 `FFmpegBurner`（Burner.swift）：ffmpeg subtitles 滤镜硬烧录 +
+/// h264_videotoolbox 硬编码。用 `makeBurner()` 获取实例。
+public protocol SubtitleBurner: Sendable {
+    /// 把 subtitle 烧录进 video，输出 "<原名>（中文字幕).mp4" 风格的新文件（不覆盖原片）；
+    /// progress 为 0...1。失败抛 VDLError.burnFailed；支持任务取消（需杀掉 ffmpeg 进程）。
+    func burn(
+        video: URL,
+        subtitle: URL,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> URL
 }
 
 // MARK: - 引擎协议
