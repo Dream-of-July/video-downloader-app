@@ -613,6 +613,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     public func download(
         _ request: DownloadRequest,
+        control: TaskControlToken?,
         progress: @escaping @Sendable (DownloadProgress) -> Void
     ) async throws -> DownloadResult {
         let ytdlp = try ytDlpPath()

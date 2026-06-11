@@ -233,6 +233,7 @@ public struct AnthropicTranslator: SubtitleTranslator {
     public func translate(
         srtFile: URL,
         style: SubtitleStyle,
+        control: TaskControlToken?,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
         let raw: String

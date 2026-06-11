@@ -224,26 +224,52 @@ public struct SubtitleCue: Sendable {
 /// 通过 Anthropic Messages API 协议（POST {baseURL}/v1/messages）调用配置的模型，
 /// 兼容官方 API 与任何 Anthropic 协议网关。用 `makeTranslator(settings:)` 获取实例。
 public protocol SubtitleTranslator: Sendable {
-    /// 把 srt 文件翻译成中文，按 style 生成新 srt（双语：原文+中文同条；仅中文：替换原文），
+    /// 把 srt 文件翻译成中文，按 style 生成新 srt（双语：中文在上原文在下；仅中文：替换原文），
     /// 写到 srt 同目录、文件名加 ".zh" 后缀；progress 为 0...1。
-    /// 失败抛 VDLError.translateFailed；支持任务取消。
+    /// YouTube 自动字幕的重叠滚动碎句会先被清洗、按句合并再翻译。
+    /// control 非空时支持暂停（分块间挂起）与取消；失败抛 VDLError.translateFailed。
     func translate(
         srtFile: URL,
         style: SubtitleStyle,
+        control: TaskControlToken?,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL
 }
 
-/// 字幕烧录器。默认实现 `FFmpegBurner`（Burner.swift）：ffmpeg subtitles 滤镜硬烧录 +
-/// h264_videotoolbox 硬编码。用 `makeBurner()` 获取实例。
+public extension SubtitleTranslator {
+    func translate(
+        srtFile: URL,
+        style: SubtitleStyle,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> URL {
+        try await translate(srtFile: srtFile, style: style, control: nil, progress: progress)
+    }
+}
+
+/// 字幕烧录器。默认实现 `FFmpegBurner`（Burner.swift）：ffmpeg subtitles 滤镜硬烧录。
+/// 用 `makeBurner()` 获取实例。
 public protocol SubtitleBurner: Sendable {
     /// 把 subtitle 烧录进 video，输出 "<原名>（中文字幕).mp4" 风格的新文件（不覆盖原片）；
-    /// progress 为 0...1。失败抛 VDLError.burnFailed；支持任务取消（需杀掉 ffmpeg 进程）。
+    /// maxHeight 非空且源更高时缩放到该高度；progress 为 0...1。
+    /// control 非空时支持暂停/取消（向 ffmpeg 进程树发 SIGSTOP/SIGCONT、取消时终止）。
+    /// 失败抛 VDLError.burnFailed。
+    func burn(
+        video: URL,
+        subtitle: URL,
+        maxHeight: Int?,
+        control: TaskControlToken?,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> URL
+}
+
+public extension SubtitleBurner {
     func burn(
         video: URL,
         subtitle: URL,
         progress: @escaping @Sendable (Double) -> Void
-    ) async throws -> URL
+    ) async throws -> URL {
+        try await burn(video: video, subtitle: subtitle, maxHeight: nil, control: nil, progress: progress)
+    }
 }
 
 // MARK: - 引擎协议
@@ -263,9 +289,20 @@ public protocol DownloadEngine: Sendable {
     func analyze(url: String) async throws -> VideoInfo
 
     /// 第三步：按用户选择下载。进度经回调上报（任意线程）；
-    /// 通过 Swift 任务取消（Task cancellation）中止，引擎需负责终止子进程、不留僵尸进程。
+    /// control 非空时支持暂停（SIGSTOP/SIGCONT 进程树）与取消；
+    /// 也可通过 Swift 任务取消中止，引擎需负责终止子进程、不留僵尸进程。
+    func download(
+        _ request: DownloadRequest,
+        control: TaskControlToken?,
+        progress: @escaping @Sendable (DownloadProgress) -> Void
+    ) async throws -> DownloadResult
+}
+
+public extension DownloadEngine {
     func download(
         _ request: DownloadRequest,
         progress: @escaping @Sendable (DownloadProgress) -> Void
-    ) async throws -> DownloadResult
+    ) async throws -> DownloadResult {
+        try await download(request, control: nil, progress: progress)
+    }
 }

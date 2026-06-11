@@ -11,17 +11,22 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var translationAuthToken: String
     /// 烧录字幕样式
     public var subtitleStyle: SubtitleStyle
+    /// 烧录时限制最大分辨率高度：源高于此值则缩放到此值（既快又小，避开 4K60 的 H.264 上限）。
+    /// nil = 保持源分辨率。默认 1080。
+    public var maxBurnHeight: Int?
 
     public init(
         translationBaseURL: String = "https://api.anthropic.com",
         translationModel: String = "",
         translationAuthToken: String = "",
-        subtitleStyle: SubtitleStyle = .bilingual
+        subtitleStyle: SubtitleStyle = .bilingual,
+        maxBurnHeight: Int? = 1080
     ) {
         self.translationBaseURL = translationBaseURL
         self.translationModel = translationModel
         self.translationAuthToken = translationAuthToken
         self.subtitleStyle = subtitleStyle
+        self.maxBurnHeight = maxBurnHeight
     }
 
     // MARK: 存储位置
@@ -41,6 +46,24 @@ public struct AppSettings: Codable, Sendable, Equatable {
     }
 
     // MARK: 读写
+
+    private enum CodingKeys: String, CodingKey {
+        case translationBaseURL, translationModel, translationAuthToken, subtitleStyle, maxBurnHeight
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        translationBaseURL = try c.decodeIfPresent(String.self, forKey: .translationBaseURL) ?? "https://api.anthropic.com"
+        translationModel = try c.decodeIfPresent(String.self, forKey: .translationModel) ?? ""
+        translationAuthToken = try c.decodeIfPresent(String.self, forKey: .translationAuthToken) ?? ""
+        subtitleStyle = try c.decodeIfPresent(SubtitleStyle.self, forKey: .subtitleStyle) ?? .bilingual
+        // 旧版 settings.json 没有这个键：缺失时按默认 1080 处理，而非「保持源分辨率」
+        if c.contains(.maxBurnHeight) {
+            maxBurnHeight = try c.decodeIfPresent(Int.self, forKey: .maxBurnHeight)
+        } else {
+            maxBurnHeight = 1080
+        }
+    }
 
     public static func load() -> AppSettings {
         guard let data = try? Data(contentsOf: settingsFileURL),

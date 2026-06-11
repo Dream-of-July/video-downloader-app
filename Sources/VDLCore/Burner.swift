@@ -43,6 +43,8 @@ public struct FFmpegBurner: SubtitleBurner {
     public func burn(
         video: URL,
         subtitle: URL,
+        maxHeight: Int?,
+        control: TaskControlToken?,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
         guard let ffmpeg = Self.locate("ffmpeg") else {
