@@ -13,10 +13,27 @@ public struct FFmpegBurner: SubtitleBurner {
 
     public init() {}
 
-    private static let searchDirectories = ["/opt/homebrew/bin", "/usr/local/bin"]
+    // 烧录需要带 libass 的 ffmpeg（subtitles 滤镜）。Homebrew 镜像的 ffmpeg 可能是
+    // 无 libass 的精简版，因此优先找 keg-only 的 ffmpeg-full。
+    private static let searchPaths = [
+        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+        "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    ]
 
     private static func locate(_ name: String) -> String? {
-        for dir in searchDirectories {
+        if name == "ffmpeg" {
+            if let custom = ProcessInfo.processInfo.environment["VDL_BURN_FFMPEG_PATH"],
+               !custom.isEmpty, FileManager.default.isExecutableFile(atPath: custom) {
+                return custom
+            }
+            for path in searchPaths where FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+            return nil
+        }
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
             let path = dir + "/" + name
             if FileManager.default.isExecutableFile(atPath: path) { return path }
         }
@@ -99,6 +116,12 @@ public struct FFmpegBurner: SubtitleBurner {
             }
         }
         guard status == 0 else {
+            let lower = stderrTail.lowercased()
+            if lower.contains("error parsing filterchain") || lower.contains("no such filter") {
+                throw VDLError.burnFailed(
+                    "当前 ffmpeg 不带字幕渲染组件（libass）。请安装完整版后重试：brew install ffmpeg-full"
+                )
+            }
             throw VDLError.burnFailed(Self.lastLine(of: stderrTail))
         }
         let produced = tempDir.appendingPathComponent("out.mp4")
