@@ -3,7 +3,7 @@ import Foundation
 // MARK: - 默认翻译器
 
 public func makeTranslator(settings: AppSettings) -> any SubtitleTranslator {
-    AnthropicTranslator(settings: settings)
+    ConfiguredTranslator(settings: settings)
 }
 
 // MARK: - SRT 解析与序列化
@@ -205,43 +205,105 @@ func cleanCues(_ input: [SubtitleCue]) -> [SubtitleCue] {
     return makeCues(merged)
 }
 
-// MARK: - Anthropic Messages API 请求
+// MARK: - LLM API 请求
 
-/// Messages API 一次调用的结果：text 块拼接后的文本 + stop_reason。
-struct AnthropicReply {
+/// 一次模型调用的结果：文本 + 是否因为输出上限被截断。
+struct ModelReply {
     let text: String
-    let stopReason: String?
+    let reachedOutputLimit: Bool
 }
 
-/// 调一次 Messages API，返回回复里所有 type=="text" 块拼接的文本与 stop_reason。
+func sendConfiguredMessage(
+    settings: AppSettings,
+    system: String?,
+    userContent: String,
+    maxTokens: Int
+) async throws -> ModelReply {
+    switch settings.translationProvider {
+    case .anthropic:
+        return try await sendAnthropicMessage(
+            settings: settings,
+            system: system,
+            userContent: userContent,
+            maxTokens: maxTokens
+        )
+    case .openai:
+        return try await sendOpenAIResponse(
+            settings: settings,
+            instructions: system,
+            input: userContent,
+            maxOutputTokens: maxTokens
+        )
+    }
+}
+
+private func normalizedToken(_ raw: String) -> String {
+    var token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    // 用户误把 "Bearer xxx" 整段贴进凭证框时剥掉前缀，避免双重 Bearer。
+    if token.lowercased().hasPrefix("bearer ") {
+        token = String(token.dropFirst("bearer ".count)).trimmingCharacters(in: .whitespaces)
+    }
+    return token
+}
+
+private func endpointURL(baseURL: String, endpointPath: String) throws -> URL {
+    var base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    while base.hasSuffix("/") { base.removeLast() }
+
+    let path = endpointPath.hasPrefix("/") ? endpointPath : "/" + endpointPath
+    let lowerBase = base.lowercased()
+    let lowerPath = path.lowercased()
+    let urlString: String
+    if lowerBase.hasSuffix(lowerPath) {
+        urlString = base
+    } else if lowerBase.hasSuffix("/v1"), lowerPath.hasPrefix("/v1/") {
+        urlString = base + String(path.dropFirst("/v1".count))
+    } else {
+        urlString = base + path
+    }
+
+    guard !base.isEmpty,
+          let url = URL(string: urlString),
+          let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+          url.host != nil else {
+        throw VDLError.translateFailed("服务地址无效")
+    }
+    return url
+}
+
+private func responseErrorMessage(from data: Data) -> String {
+    struct ErrorBody: Decodable {
+        struct Inner: Decodable {
+            let type: String?
+            let message: String?
+        }
+        let error: Inner?
+    }
+    let decoded = (try? JSONDecoder().decode(ErrorBody.self, from: data))?.error?.message
+    let fallback = String(decoding: data.prefix(200), as: UTF8.self)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return decoded ?? (fallback.isEmpty ? "请求失败" : fallback)
+}
+
+/// 调一次 Anthropic Messages API，返回回复里所有 type=="text" 块拼接后的文本。
 /// 429/5xx 指数退避重试最多 2 次（2s、8s）；其余错误映射为 VDLError。
 func sendAnthropicMessage(
     settings: AppSettings,
     system: String?,
     userContent: String,
     maxTokens: Int
-) async throws -> AnthropicReply {
+) async throws -> ModelReply {
     let model = settings.translationModel.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !model.isEmpty else {
         throw VDLError.translateFailed("尚未配置模型，请在设置里填写模型名称。")
     }
-    var token = settings.translationAuthToken.trimmingCharacters(in: .whitespacesAndNewlines)
-    // 用户误把 "Bearer xxx" 整段贴进凭证框时剥掉前缀，避免双重 Bearer。
-    if token.lowercased().hasPrefix("bearer ") {
-        token = String(token.dropFirst("bearer ".count)).trimmingCharacters(in: .whitespaces)
-    }
+    let token = normalizedToken(settings.translationAuthToken)
     guard !token.isEmpty else {
         throw VDLError.translateFailed("尚未配置 API 凭证，请在设置里填写。")
     }
 
-    var base = settings.translationBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-    while base.hasSuffix("/") { base.removeLast() }
-    guard !base.isEmpty,
-          let url = URL(string: base + "/v1/messages"),
-          let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
-          let host = url.host else {
-        throw VDLError.translateFailed("服务地址无效")
-    }
+    let url = try endpointURL(baseURL: settings.translationBaseURL, endpointPath: "/v1/messages")
+    let host = url.host ?? ""
 
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -298,7 +360,7 @@ func sendAnthropicMessage(
                     throw VDLError.translateFailed("服务响应不符合 Anthropic Messages 协议，请检查服务地址。")
                 }
                 let text = reply.content.filter { $0.type == "text" }.compactMap(\.text).joined()
-                return AnthropicReply(text: text, stopReason: reply.stop_reason)
+                return ModelReply(text: text, reachedOutputLimit: reply.stop_reason == "max_tokens")
             }
             let retryable = http.statusCode == 429 || (500...599).contains(http.statusCode)
             if retryable, attempt < backoffNanoseconds.count {
@@ -306,18 +368,118 @@ func sendAnthropicMessage(
                 attempt += 1
                 continue
             }
-            struct ErrorBody: Decodable {
-                struct Inner: Decodable {
-                    let type: String?
-                    let message: String?
-                }
-                let error: Inner?
+            throw VDLError.translateFailed("HTTP \(http.statusCode)：\(responseErrorMessage(from: data))")
+        } catch let error as VDLError {
+            throw error
+        } catch is CancellationError {
+            throw VDLError.cancelled
+        } catch let error as URLError {
+            if error.code == .cancelled { throw VDLError.cancelled }
+            throw VDLError.translateFailed("无法连接到翻译服务，请检查服务地址和网络。")
+        } catch {
+            throw VDLError.translateFailed(error.localizedDescription)
+        }
+    }
+}
+
+/// 调一次 OpenAI Responses API，返回 output_text 块拼接后的文本。
+/// 429/5xx 指数退避重试最多 2 次（2s、8s）；其余错误映射为 VDLError。
+func sendOpenAIResponse(
+    settings: AppSettings,
+    instructions: String?,
+    input: String,
+    maxOutputTokens: Int
+) async throws -> ModelReply {
+    let model = settings.translationModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !model.isEmpty else {
+        throw VDLError.translateFailed("尚未配置模型，请在设置里填写模型名称。")
+    }
+    let token = normalizedToken(settings.translationAuthToken)
+    guard !token.isEmpty else {
+        throw VDLError.translateFailed("尚未配置 API 凭证，请在设置里填写。")
+    }
+
+    let url = try endpointURL(baseURL: settings.translationBaseURL, endpointPath: "/v1/responses")
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 120
+    request.setValue("application/json", forHTTPHeaderField: "content-type")
+    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+    struct Payload: Encodable {
+        let model: String
+        let instructions: String?
+        let input: String
+        let max_output_tokens: Int
+        let store: Bool
+    }
+    do {
+        request.httpBody = try JSONEncoder().encode(Payload(
+            model: model,
+            instructions: instructions,
+            input: input,
+            max_output_tokens: maxOutputTokens,
+            store: false
+        ))
+    } catch {
+        throw VDLError.translateFailed("无法构造请求体：\(error.localizedDescription)")
+    }
+
+    let backoffNanoseconds: [UInt64] = [2_000_000_000, 8_000_000_000]
+    var attempt = 0
+    while true {
+        if Task.isCancelled { throw VDLError.cancelled }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw VDLError.translateFailed("服务返回了无法识别的响应。")
             }
-            let decoded = (try? JSONDecoder().decode(ErrorBody.self, from: data))?.error?.message
-            let fallback = String(decoding: data.prefix(200), as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let message = decoded ?? (fallback.isEmpty ? "请求失败" : fallback)
-            throw VDLError.translateFailed("HTTP \(http.statusCode)：\(message)")
+            if http.statusCode == 200 {
+                struct Content: Decodable {
+                    let type: String
+                    let text: String?
+                }
+                struct OutputItem: Decodable {
+                    let type: String
+                    let content: [Content]?
+                }
+                struct IncompleteDetails: Decodable {
+                    let reason: String?
+                }
+                struct Reply: Decodable {
+                    let output: [OutputItem]
+                    let status: String?
+                    let incomplete_details: IncompleteDetails?
+                }
+                guard let reply = try? JSONDecoder().decode(Reply.self, from: data) else {
+                    throw VDLError.translateFailed("服务响应不符合 OpenAI Responses 协议，请检查服务地址。")
+                }
+                let messageItems: [OutputItem] = reply.output.filter { $0.type == "message" }
+                var textParts: [String] = []
+                for item in messageItems {
+                    let blocks = item.content ?? []
+                    for block in blocks where block.type == "output_text" || block.type == "text" {
+                        if let t = block.text { textParts.append(t) }
+                    }
+                }
+                let text = textParts.joined()
+                guard !text.isEmpty else {
+                    throw VDLError.translateFailed("OpenAI 响应里没有文本内容，请检查模型或服务地址。")
+                }
+                return ModelReply(
+                    text: text,
+                    reachedOutputLimit: reply.status == "incomplete"
+                        && reply.incomplete_details?.reason == "max_output_tokens"
+                )
+            }
+            let retryable = http.statusCode == 429 || (500...599).contains(http.statusCode)
+            if retryable, attempt < backoffNanoseconds.count {
+                try await Task.sleep(nanoseconds: backoffNanoseconds[attempt])
+                attempt += 1
+                continue
+            }
+            throw VDLError.translateFailed("HTTP \(http.statusCode)：\(responseErrorMessage(from: data))")
         } catch let error as VDLError {
             throw error
         } catch is CancellationError {
@@ -335,7 +497,7 @@ func sendAnthropicMessage(
 
 /// 设置面板「测试连接」：发一条迷你请求，返回模型回复文本。
 public func testTranslationConnection(settings: AppSettings) async throws -> String {
-    let reply = try await sendAnthropicMessage(
+    let reply = try await sendConfiguredMessage(
         settings: settings,
         system: nil,
         userContent: "请只回复两个字：正常",
@@ -344,10 +506,10 @@ public func testTranslationConnection(settings: AppSettings) async throws -> Str
     return reply.text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-// MARK: - AnthropicTranslator
+// MARK: - ConfiguredTranslator
 
-/// 通过 Anthropic Messages API 协议翻译字幕。服务地址、模型、凭证全部来自 AppSettings。
-public struct AnthropicTranslator: SubtitleTranslator {
+/// 通过设置里选择的协议翻译字幕。服务地址、模型、凭证全部来自 AppSettings。
+public struct ConfiguredTranslator: SubtitleTranslator {
     private let settings: AppSettings
 
     /// 每次请求翻译的字幕条数
@@ -435,13 +597,13 @@ public struct AnthropicTranslator: SubtitleTranslator {
             "\(startNumber + offset)|\(Self.flattened(cue.text))"
         }.joined(separator: "\n")
 
-        let reply = try await sendAnthropicMessage(
+        let reply = try await sendConfiguredMessage(
             settings: settings,
             system: Self.systemPrompt,
             userContent: userContent,
             maxTokens: 8000
         )
-        if reply.stopReason == "max_tokens" {
+        if reply.reachedOutputLimit {
             let half = chunk.count / 2
             guard depth < 2, half >= 8 else {
                 throw VDLError.translateFailed("译文超出模型输出上限，请减小每块字幕条数或检查模型 max_tokens 限制")
@@ -488,3 +650,6 @@ public struct AnthropicTranslator: SubtitleTranslator {
         return map
     }
 }
+
+@available(*, deprecated, renamed: "ConfiguredTranslator")
+public typealias AnthropicTranslator = ConfiguredTranslator

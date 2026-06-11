@@ -410,6 +410,13 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if model.chineseMode != .off, model.translationSourceIsChinese(in: info) {
+                Text(model.chineseMode == .burnIn
+                     ? "该字幕已是中文，将直接烧录（不翻译）"
+                     : "该字幕已是中文，将直接使用（不翻译）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)

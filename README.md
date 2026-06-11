@@ -33,6 +33,20 @@ swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli analyze <url>
 swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli download <url> --video-id <id> --format <formatID> [--subs en] [--auto-subs zh-Hans] [--dest 路径]
 ```
 
+## 字幕翻译 API
+
+设置页支持两种接口协议：
+
+- `Anthropic / Claude`：用于 Anthropic 官方 API 或公司 Claude 网关。公司网关按 `ANTHROPIC_BASE_URL` 填服务地址，按 `ANTHROPIC_AUTH_TOKEN` 填凭证。
+- `OpenAI`：用于 OpenAI Responses API。服务地址填 `https://api.openai.com`，模型填 OpenAI 模型名，凭证填 OpenAI API key。
+
+CLI 也可以临时覆盖：
+
+```sh
+swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli ping-llm --provider anthropic --base "$ANTHROPIC_BASE_URL" --model claude-haiku-4-5 --token "$ANTHROPIC_AUTH_TOKEN"
+swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli ping-llm --provider openai --base https://api.openai.com --model gpt-5.4 --token "$OPENAI_API_KEY"
+```
+
 ## 目录结构
 
 - `Sources/VDLCore/` — 核心：契约类型（`Models.swift`）、yt-dlp 封装（`Engine.swift`）、页面嗅探（`PageSniffer.swift`）

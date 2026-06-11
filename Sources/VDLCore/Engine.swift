@@ -207,6 +207,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     private let cacheLock = NSLock()
     private var infoCache: [String: [String: Any]] = [:]
+    /// analyze 阶段从 HLS master m3u8 解析出的字幕表：sourceURL -> [langCode: 字幕 m3u8 绝对 URL]。
+    /// download 阶段据此用 ffmpeg 取这些 yt-dlp 拿不到的 HLS 内嵌字幕。
+    private var hlsSubtitleCache: [String: [String: String]] = [:]
 
     public init() {}
 
@@ -239,6 +242,18 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             throw VDLError.binaryNotFound("ffmpeg")
         }
         return (path as NSString).deletingLastPathComponent
+    }
+
+    /// HLS 字幕转 srt 用的 ffmpeg：与 Burner 一致优先 ffmpeg-full，其次 Homebrew ffmpeg。
+    /// （转 srt 不需要 libass，但统一定位逻辑、避免精简版边角问题。）
+    private static func locateSubtitleFFmpeg() -> String? {
+        let fm = FileManager.default
+        let candidates = [
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+            "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+        ]
+        for path in candidates where fm.isExecutableFile(atPath: path) { return path }
+        return locateBinary(named: "ffmpeg", envVar: "VDL_FFMPEG_PATH")
     }
 
     private func ffprobePath() -> String? {
@@ -306,6 +321,18 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     private func setCachedInfo(_ info: [String: Any], for url: String) {
         cacheLock.lock()
         infoCache[url] = info
+        cacheLock.unlock()
+    }
+
+    private func cachedHLSSubtitles(for url: String) -> [String: String]? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return hlsSubtitleCache[url]
+    }
+
+    private func setCachedHLSSubtitles(_ table: [String: String], for url: String) {
+        cacheLock.lock()
+        hlsSubtitleCache[url] = table
         cacheLock.unlock()
     }
 
@@ -488,6 +515,17 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
         formats.append(FormatChoice(id: "audio", label: "仅音频 · m4a", detail: nil, isAudioOnly: true))
 
+        var subtitles = Self.parseSubtitles(json: json)
+        // yt-dlp 没给字幕时（如 Apple WWDC 等走 generic/HLS 提取器的页面，字幕只存在于
+        // HLS master manifest 里且被 yt-dlp 主动忽略），从 manifest 兜底解析内嵌字幕。
+        if subtitles.isEmpty {
+            let (choices, table) = await discoverHLSSubtitles(in: rawFormats)
+            if !choices.isEmpty {
+                subtitles = choices
+                setCachedHLSSubtitles(table, for: sourceURL)
+            }
+        }
+
         return VideoInfo(
             sourceURL: sourceURL,
             videoID: videoID,
@@ -496,8 +534,98 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             thumbnailURL: thumbnailURL,
             uploader: uploader,
             formats: formats,
-            subtitles: Self.parseSubtitles(json: json)
+            subtitles: subtitles
         )
+    }
+
+    // MARK: HLS manifest 内嵌字幕兜底
+
+    /// 从 formats 的 manifest_url 抓取 HLS master m3u8，解析其中的 EXT-X-MEDIA:TYPE=SUBTITLES，
+    /// 返回（SubtitleChoice 列表, [langCode: 字幕 m3u8 绝对 URL]）。失败返回空，绝不抛错（不能让 analyze 失败）。
+    private func discoverHLSSubtitles(
+        in formats: [[String: Any]]
+    ) async -> (choices: [SubtitleChoice], table: [String: String]) {
+        guard let manifest = formats.compactMap({ $0["manifest_url"] as? String })
+            .first(where: { !$0.isEmpty }),
+              let masterURL = URL(string: manifest),
+              let text = await Self.fetchText(url: masterURL) else {
+            return ([], [:])
+        }
+        let entries = Self.parseHLSSubtitleEntries(master: text, baseURL: masterURL)
+        guard !entries.isEmpty else { return ([], [:]) }
+
+        var table: [String: String] = [:]
+        var seen = Set<String>()
+        var choices: [SubtitleChoice] = []
+        // 中文优先排序，最多保留 30 条。
+        let sorted = entries.sorted { Self.subtitleSortKey($0.lang) < Self.subtitleSortKey($1.lang) }
+        for entry in sorted.prefix(30) {
+            guard !seen.contains(entry.lang) else { continue }
+            seen.insert(entry.lang)
+            table[entry.lang] = entry.url
+            let label: String
+            let localized = Self.subtitleLabel(for: entry.lang)
+            // subtitleLabel 认得的语言用本地化名，否则退回 manifest 里的 NAME。
+            if localized != entry.lang {
+                label = localized
+            } else if let name = entry.name, !name.isEmpty {
+                label = "\(name) (\(entry.lang))"
+            } else {
+                label = entry.lang
+            }
+            choices.append(SubtitleChoice(id: entry.lang, label: label, isAuto: false))
+        }
+        return (choices, table)
+    }
+
+    private struct HLSSubtitleEntry {
+        let lang: String
+        let name: String?
+        let url: String
+    }
+
+    /// 解析 master m3u8 文本里所有 TYPE=SUBTITLES 的媒体行；URI 相对 baseURL 解析为绝对地址。
+    private static func parseHLSSubtitleEntries(master: String, baseURL: URL) -> [HLSSubtitleEntry] {
+        var entries: [HLSSubtitleEntry] = []
+        for line in master.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("#EXT-X-MEDIA:"), trimmed.contains("TYPE=SUBTITLES") else { continue }
+            guard let lang = attribute("LANGUAGE", in: trimmed), !lang.isEmpty,
+                  let uri = attribute("URI", in: trimmed), !uri.isEmpty else { continue }
+            let resolved: String
+            if let abs = URL(string: uri), abs.scheme != nil {
+                resolved = abs.absoluteString
+            } else if let rel = URL(string: uri, relativeTo: baseURL) {
+                resolved = rel.absoluteString
+            } else {
+                continue
+            }
+            entries.append(HLSSubtitleEntry(lang: lang, name: attribute("NAME", in: trimmed), url: resolved))
+        }
+        return entries
+    }
+
+    /// 从 EXT-X-MEDIA 行里取属性值（支持带引号与不带引号）。
+    private static func attribute(_ key: String, in line: String) -> String? {
+        guard let range = line.range(of: key + "=") else { return nil }
+        let rest = line[range.upperBound...]
+        if rest.first == "\"" {
+            let afterQuote = rest.dropFirst()
+            guard let end = afterQuote.firstIndex(of: "\"") else { return nil }
+            return String(afterQuote[..<end])
+        }
+        let end = rest.firstIndex(of: ",") ?? rest.endIndex
+        return String(rest[..<end]).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// 同步等待的文本抓取（Safari UA、15s 超时）。失败返回 nil。
+    private static func fetchText(url: URL) async -> String? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        request.setValue(PageSniffer.userAgent, forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+        return String(decoding: data, as: UTF8.self)
     }
 
     // MARK: ffprobe / HEAD 补充信息
@@ -703,7 +831,82 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         guard !files.isEmpty else {
             throw VDLError.downloadFailed("下载进程已结束，但在目标目录里没有找到产出文件。")
         }
+
+        // yt-dlp 取不到的字幕（如 Apple WWDC 等只存在于 HLS manifest 里的字幕）：
+        // 检测请求的字幕里哪些没落地 .srt，对缺失的 lang 用 ffmpeg 从 HLS 字幕 m3u8 转出。
+        if !allSubLangs.isEmpty {
+            let videoFile = files.first {
+                !Self.subtitleExtensions.contains($0.pathExtension.lowercased())
+            }
+            if let videoFile {
+                let presentLangs = Set(files
+                    .filter { $0.pathExtension.lowercased() == "srt" }
+                    .compactMap { Self.langCode(ofSubtitle: $0) })
+                let missing = allSubLangs.filter { !presentLangs.contains($0.lowercased()) }
+                if !missing.isEmpty {
+                    let table = await hlsSubtitleTable(for: request.url)
+                    for lang in missing {
+                        guard let m3u8 = table[lang] else { continue }
+                        if let srt = await Self.fetchHLSSubtitle(
+                            m3u8: m3u8, lang: lang, videoFile: videoFile
+                        ), !files.contains(srt) {
+                            files.append(srt)
+                        }
+                    }
+                }
+            }
+        }
         return DownloadResult(files: files)
+    }
+
+    /// 取 sourceURL 的 HLS 字幕表：优先用 analyze 阶段缓存（GUI 同一引擎实例命中）；
+    /// 缓存缺失（如 CLI download 独立进程）时按需重新拉 JSON + 解析 manifest。
+    private func hlsSubtitleTable(for url: String) async -> [String: String] {
+        if let cached = cachedHLSSubtitles(for: url) { return cached }
+        let json: [String: Any]
+        if let info = cachedInfo(for: url) {
+            json = info
+        } else if case .success(let dict) = (try? await runYtDlpJSON(for: url)) ?? .failure(stderr: "") {
+            json = dict
+        } else {
+            return [:]
+        }
+        let rawFormats = (json["formats"] as? [[String: Any]]) ?? []
+        let (_, table) = await discoverHLSSubtitles(in: rawFormats)
+        if !table.isEmpty { setCachedHLSSubtitles(table, for: url) }
+        return table
+    }
+
+    /// 从字幕文件名 "<名>.<lang>.srt" 解析出 lang code（小写）。
+    private static func langCode(ofSubtitle file: URL) -> String? {
+        let stem = file.deletingPathExtension().lastPathComponent
+        guard let dotIndex = stem.lastIndex(of: ".") else { return nil }
+        return String(stem[stem.index(after: dotIndex)...]).lowercased()
+    }
+
+    /// 用 ffmpeg 把单语 HLS 字幕 m3u8 转成 srt，输出 "<视频名去扩展>.<lang>.srt"。
+    /// 失败返回 nil（记日志、跳过该 lang，不影响整体下载）。
+    private static func fetchHLSSubtitle(m3u8: String, lang: String, videoFile: URL) async -> URL? {
+        let ffmpeg = locateSubtitleFFmpeg()
+        guard let ffmpeg else {
+            FileHandle.standardError.write(Data("HLS 字幕转换跳过（找不到 ffmpeg）：\(lang)\n".utf8))
+            return nil
+        }
+        let stem = videoFile.deletingPathExtension().lastPathComponent
+        let output = videoFile.deletingLastPathComponent()
+            .appendingPathComponent("\(stem).\(lang).srt")
+        try? FileManager.default.removeItem(at: output)
+        let result = try? await runStreamingProcess(
+            executable: ffmpeg,
+            arguments: ["-y", "-i", m3u8, output.path],
+            onLine: { _ in }
+        )
+        if let result, result.status == 0,
+           FileManager.default.fileExists(atPath: output.path) {
+            return output
+        }
+        FileHandle.standardError.write(Data("HLS 字幕转换失败，已跳过：\(lang)\n".utf8))
+        return nil
     }
 
     /// 取消后清理 yt-dlp 留下的临时文件（.part / .ytdl / 分片 .part-Frag…）。

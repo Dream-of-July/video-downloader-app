@@ -34,6 +34,10 @@ struct SettingsView: View {
             }
             .formStyle(.grouped)
             // 任一字段被改动：上一次的测试结果不再可信，回到初始态。
+            .onChange(of: draft.translationProvider) {
+                updateBaseURLForProviderChange()
+                resetTestState()
+            }
             .onChange(of: draft.translationBaseURL) { resetTestState() }
             .onChange(of: draft.translationModel) { resetTestState() }
             .onChange(of: draft.translationAuthToken) { resetTestState() }
@@ -56,21 +60,25 @@ struct SettingsView: View {
 
     private var translationSection: some View {
         Section("翻译服务") {
+            Picker("接口协议", selection: $draft.translationProvider) {
+                Text("Anthropic / Claude").tag(TranslationProvider.anthropic)
+                Text("OpenAI").tag(TranslationProvider.openai)
+            }
             TextField(
                 "服务地址",
                 text: $draft.translationBaseURL,
-                prompt: Text("https://api.anthropic.com 或企业网关地址")
+                prompt: Text(baseURLPrompt)
             )
             .autocorrectionDisabled()
             TextField(
                 "模型名",
                 text: $draft.translationModel,
-                prompt: Text("例如 claude-haiku-4-5 / 网关模型名")
+                prompt: Text(modelPrompt)
             )
             .autocorrectionDisabled()
             VStack(alignment: .leading, spacing: 4) {
                 SecureField("API 凭证", text: $draft.translationAuthToken)
-                Text("官方 API 填 API key；企业网关填网关签发的凭证。只填凭证本身，不要带 Bearer 前缀。")
+                Text(credentialHelpText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -99,6 +107,40 @@ struct SettingsView: View {
                 Spacer(minLength: 0)
             }
         }
+    }
+
+    private var baseURLPrompt: String {
+        switch draft.translationProvider {
+        case .anthropic:
+            return "https://api.anthropic.com 或企业网关地址"
+        case .openai:
+            return "https://api.openai.com"
+        }
+    }
+
+    private var modelPrompt: String {
+        switch draft.translationProvider {
+        case .anthropic:
+            return "例如 claude-haiku-4-5 / 网关模型名"
+        case .openai:
+            return "例如 gpt-5.4 / gpt-4.1"
+        }
+    }
+
+    private var credentialHelpText: String {
+        switch draft.translationProvider {
+        case .anthropic:
+            return "公司网关按 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 填写；只填凭证本身，不要带 Bearer 前缀。"
+        case .openai:
+            return "OpenAI 使用 Responses API。服务地址填 https://api.openai.com；凭证填 OpenAI API key，不要带 Bearer 前缀。"
+        }
+    }
+
+    private func updateBaseURLForProviderChange() {
+        let trimmed = draft.translationBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultURLs = Set(TranslationProvider.allCases.map(\.defaultBaseURL))
+        guard trimmed.isEmpty || defaultURLs.contains(trimmed) else { return }
+        draft.translationBaseURL = draft.translationProvider.defaultBaseURL
     }
 
     /// 任一字段被改动：上一次的测试结果不再可信，回到初始态。

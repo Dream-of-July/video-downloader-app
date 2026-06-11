@@ -1,9 +1,25 @@
 import Foundation
 
+public enum TranslationProvider: String, Codable, Sendable, Equatable, CaseIterable {
+    case anthropic
+    case openai
+
+    public var defaultBaseURL: String {
+        switch self {
+        case .anthropic:
+            return "https://api.anthropic.com"
+        case .openai:
+            return "https://api.openai.com"
+        }
+    }
+}
+
 /// App 设置。持久化在 ~/Library/Application Support/视频下载器/settings.json（0600）。
 /// 注意：authToken 属于敏感凭证，只落在本地配置文件，绝不写入代码、日志或版本库。
 public struct AppSettings: Codable, Sendable, Equatable {
-    /// Anthropic 协议服务地址（官方 API 或企业网关），不含 /v1/messages 路径
+    /// 翻译接口协议
+    public var translationProvider: TranslationProvider
+    /// 翻译服务地址（官方 API 或企业网关），不含 /v1/messages 或 /v1/responses 路径
     public var translationBaseURL: String
     /// 模型名，例如 "claude-haiku-4-5" 或网关侧的模型标识
     public var translationModel: String
@@ -16,12 +32,14 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var maxBurnHeight: Int?
 
     public init(
-        translationBaseURL: String = "https://api.anthropic.com",
+        translationProvider: TranslationProvider = .anthropic,
+        translationBaseURL: String = TranslationProvider.anthropic.defaultBaseURL,
         translationModel: String = "",
         translationAuthToken: String = "",
         subtitleStyle: SubtitleStyle = .bilingual,
         maxBurnHeight: Int? = 1080
     ) {
+        self.translationProvider = translationProvider
         self.translationBaseURL = translationBaseURL
         self.translationModel = translationModel
         self.translationAuthToken = translationAuthToken
@@ -48,13 +66,16 @@ public struct AppSettings: Codable, Sendable, Equatable {
     // MARK: 读写
 
     private enum CodingKeys: String, CodingKey {
-        case translationBaseURL, translationModel, translationAuthToken, subtitleStyle, maxBurnHeight
+        case translationProvider, translationBaseURL, translationModel, translationAuthToken, subtitleStyle, maxBurnHeight
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        translationBaseURL = try c.decodeIfPresent(String.self, forKey: .translationBaseURL) ?? "https://api.anthropic.com"
+        translationBaseURL = try c.decodeIfPresent(String.self, forKey: .translationBaseURL)
+            ?? TranslationProvider.anthropic.defaultBaseURL
         translationModel = try c.decodeIfPresent(String.self, forKey: .translationModel) ?? ""
+        translationProvider = try c.decodeIfPresent(TranslationProvider.self, forKey: .translationProvider)
+            ?? Self.inferProvider(baseURL: translationBaseURL, model: translationModel)
         translationAuthToken = try c.decodeIfPresent(String.self, forKey: .translationAuthToken) ?? ""
         subtitleStyle = try c.decodeIfPresent(SubtitleStyle.self, forKey: .subtitleStyle) ?? .bilingual
         // 旧版 settings.json 没有这个键：缺失时按默认 1080 处理，而非「保持源分辨率」
@@ -95,5 +116,19 @@ public struct AppSettings: Codable, Sendable, Equatable {
         !translationBaseURL.trimmingCharacters(in: .whitespaces).isEmpty
             && !translationModel.trimmingCharacters(in: .whitespaces).isEmpty
             && !translationAuthToken.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private static func inferProvider(baseURL: String, model: String) -> TranslationProvider {
+        let normalizedBase = baseURL.lowercased()
+        let normalizedModel = model.lowercased()
+        if normalizedBase.contains("api.openai.com")
+            || normalizedModel.hasPrefix("gpt-")
+            || normalizedModel.hasPrefix("o1")
+            || normalizedModel.hasPrefix("o3")
+            || normalizedModel.hasPrefix("o4")
+            || normalizedModel.hasPrefix("o5") {
+            return .openai
+        }
+        return .anthropic
     }
 }

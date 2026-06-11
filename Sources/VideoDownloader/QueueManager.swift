@@ -221,6 +221,52 @@ final class QueueManager: ObservableObject {
             return
         }
 
+        // 成熟的中文软字幕：源字幕本身就是中文时直接当中文字幕用，跳过 LLM 翻译。
+        // 判定优先用 request 里记录的 lang，回退按所选文件名 ".<lang>.srt" 解析。
+        let sourceIsChinese = Self.isChineseLang(preferredLang)
+            || Self.isChineseLang(Self.langCode(of: srtFile))
+        if sourceIsChinese {
+            // srtOnly：原中文 srt 即结果（已在 downloadFiles 里），不再生成 .zh.srt。
+            guard mode == .burnIn else {
+                finishDone(id, files: downloadFiles, statusText: "使用视频自带中文字幕，已跳过翻译")
+                return
+            }
+            // burnIn：直接拿原中文 srt 去烧录。
+            guard let video = downloadFiles.first(where: {
+                Self.videoExtensions.contains($0.pathExtension.lowercased())
+            }) else {
+                finishDone(id, files: downloadFiles, statusText: "没有找到视频文件，已跳过烧录")
+                return
+            }
+            update(id) { $0.stage = .burning; $0.progress = nil; $0.statusText = "使用视频自带中文字幕，直接烧录（不翻译）" }
+            do {
+                let burner = makeBurner()
+                let burned = try await burner.burn(
+                    video: video,
+                    subtitle: srtFile,
+                    maxHeight: settings.maxBurnHeight,
+                    control: control
+                ) { [weak self] p in
+                    Task { @MainActor in
+                        self?.update(id, generation: generation) {
+                            guard $0.stage == .burning else { return }
+                            $0.progress = p
+                        }
+                    }
+                }
+                guard item(id) != nil else { return }
+                update(id) {
+                    $0.resultFiles.removeAll { $0 == burned }
+                    $0.resultFiles.insert(burned, at: 0)
+                }
+                finishDone(id, files: item(id)?.resultFiles ?? downloadFiles, statusText: "已烧录视频自带中文字幕")
+            } catch {
+                guard item(id) != nil else { return }
+                settlePartial(id, files: item(id)?.resultFiles ?? downloadFiles, error: error, phase: "烧录")
+            }
+            return
+        }
+
         // 2. 翻译
         update(id) { $0.stage = .translating; $0.progress = nil; $0.statusText = nil }
         let zhSrt: URL
@@ -454,25 +500,33 @@ final class QueueManager: ObservableObject {
         }
     }
 
-    /// 按勾选语言挑翻译源字幕（与 ViewModel 旧逻辑一致）：大小写不敏感、允许前缀匹配，回退第一个 .srt。
-    /// 显式排除以 ".zh.srt" 结尾的译文文件，避免 preferredLang 为空时把上次译文当源二次翻译。
+    /// lang code 以 zh 开头视为中文（zh / zh-Hans / zh-Hant / zh-CN / zh-TW 等）。
+    private static func isChineseLang(_ lang: String?) -> Bool {
+        guard let lang = lang?.lowercased(), !lang.isEmpty else { return false }
+        let prefix = lang.split(separator: "-").first.map(String.init) ?? lang
+        return prefix == "zh"
+    }
+
+    /// 从字幕文件名 "<名>.<lang>.srt" 解析出 lang code（无法解析返回 nil）。
+    private static func langCode(of file: URL) -> String? {
+        let stem = file.deletingPathExtension().lastPathComponent
+        guard let dotIndex = stem.lastIndex(of: ".") else { return nil }
+        return String(stem[stem.index(after: dotIndex)...]).lowercased()
+    }
+
+    /// 按勾选语言挑翻译源字幕（与 ViewModel 旧逻辑一致）：大小写不敏感、允许前缀匹配。
+    /// preferredLang 命中时直接返回该文件（含 ".zh.srt"，以支持视频自带中文字幕作为源）；
+    /// 没有 preferredLang 时回退第一个非译文（不以 ".zh.srt" 结尾）的 .srt，避免把上次译文当源二次翻译。
     private static func pickSourceSubtitle(from files: [URL], preferredLang: String?) -> URL? {
-        let srtFiles = files.filter {
-            $0.pathExtension.lowercased() == "srt"
-                && !$0.lastPathComponent.lowercased().hasSuffix(".zh.srt")
-        }
-        guard let lang = preferredLang?.lowercased(), !lang.isEmpty else { return srtFiles.first }
-        func langCode(of file: URL) -> String? {
-            let stem = file.deletingPathExtension().lastPathComponent
-            guard let dotIndex = stem.lastIndex(of: ".") else { return nil }
-            return String(stem[stem.index(after: dotIndex)...]).lowercased()
-        }
-        if let matched = srtFiles.first(where: { file in
-            guard let code = langCode(of: file) else { return false }
-            return code == lang || code.hasPrefix(lang + "-") || lang.hasPrefix(code + "-")
-        }) {
+        let srtFiles = files.filter { $0.pathExtension.lowercased() == "srt" }
+        if let lang = preferredLang?.lowercased(), !lang.isEmpty,
+           let matched = srtFiles.first(where: { file in
+               guard let code = langCode(of: file) else { return false }
+               return code == lang || code.hasPrefix(lang + "-") || lang.hasPrefix(code + "-")
+           }) {
             return matched
         }
-        return srtFiles.first
+        let nonTranslated = srtFiles.filter { !$0.lastPathComponent.lowercased().hasSuffix(".zh.srt") }
+        return nonTranslated.first ?? srtFiles.first
     }
 }

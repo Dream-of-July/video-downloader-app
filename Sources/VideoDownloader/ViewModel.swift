@@ -246,6 +246,13 @@ final class ViewModel: ObservableObject {
         return chosen.first(where: { !$0.isAuto }) ?? chosen.first
     }
 
+    /// 实际翻译源字幕是否已是中文（lang code 以 zh 开头）。中文源会跳过翻译、直接使用/烧录。
+    func translationSourceIsChinese(in info: VideoInfo) -> Bool {
+        guard let source = translationSourceSubtitle(in: info) else { return false }
+        let prefix = source.id.lowercased().split(separator: "-").first.map(String.init)
+        return prefix == "zh"
+    }
+
     func backToList() {
         guard candidates.count > 1 else { return }
         session += 1

@@ -15,12 +15,13 @@ let usageText = """
   vdl-cli analyze <url>
   vdl-cli download <url> --video-id <id> --format <formatID> \
 [--subs en,zh] [--auto-subs en] [--dest 路径]
-  vdl-cli translate <srt路径> [--style bilingual|zh] [--base 服务地址] [--model 模型] [--token 凭证]
+  vdl-cli translate <srt路径> [--style bilingual|zh] [--provider anthropic|openai] [--base 服务地址] [--model 模型] [--token 凭证]
   vdl-cli burn <视频> <srt> [--max-height N | --keep-resolution]
-  vdl-cli ping-llm [--base 服务地址] [--model 模型] [--token 凭证]
+  vdl-cli ping-llm [--provider anthropic|openai] [--base 服务地址] [--model 模型] [--token 凭证]
 
 说明：
-  --base/--model/--token 缺省读 App 设置；--token 仅供本机调试，输出时只显示前 6 位。
+  --provider/--base/--model/--token 缺省读 App 设置；--token 仅供本机调试，输出时只显示前 6 位。
+  公司 Claude 网关通常用 --provider anthropic --base "$ANTHROPIC_BASE_URL" --token "$ANTHROPIC_AUTH_TOKEN"。
   burn 默认按设置里的最大高度缩放（缺省 1080p）；--max-height N 覆盖、--keep-resolution 保持源分辨率。
 """
 
@@ -56,6 +57,16 @@ func applyLLMFlags(
             case "zh": style = .chineseOnly
             default:
                 printErr("未知字幕样式：\(value)（支持 bilingual / zh）")
+                exit(1)
+            }
+        case "--provider":
+            switch value {
+            case "anthropic", "claude":
+                settings.translationProvider = .anthropic
+            case "openai":
+                settings.translationProvider = .openai
+            default:
+                printErr("未知接口协议：\(value)（支持 anthropic / openai）")
                 exit(1)
             }
         case "--base":
