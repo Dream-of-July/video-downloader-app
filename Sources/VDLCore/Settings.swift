@@ -13,23 +13,6 @@ public enum TranslationProvider: String, Codable, Sendable, Equatable, CaseItera
         }
     }
 
-    public var modelCandidates: [String] {
-        switch self {
-        case .anthropic:
-            return [
-                "deepseek-v4-flash",
-                "deepseek-v4-pro",
-                "claude-haiku-4-5",
-                "claude-sonnet-4-5",
-                "claude-opus-4-5",
-            ]
-        case .openai:
-            return [
-                "gpt-5.4",
-                "gpt-4.1",
-            ]
-        }
-    }
 }
 
 /// App 设置。持久化在 ~/Library/Application Support/视频下载器/settings.json（0600）。

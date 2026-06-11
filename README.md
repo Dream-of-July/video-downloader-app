@@ -35,9 +35,9 @@ swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli download <url> --vid
 
 ## 字幕翻译 API
 
-设置页支持两种接口协议，模型名可以先留空；填好服务地址和凭证后，从“可选模型”里选：
+设置页支持两种接口协议，模型名可以先留空；填好服务地址和凭证后，点「拉取模型」从服务端 `/v1/models` 取真实可用列表，再从「选择模型」里选（拉不到时也可手动填写）：
 
-- `Anthropic-compatible`：用于 Anthropic 官方 API、公司 Claude 网关，以及公司网关把 Anthropic 协议映射到 DeepSeek 的场景。DeepSeek 映射优先试 `deepseek-v4-flash` / `deepseek-v4-pro`。
+- `Anthropic-compatible`：用于 Anthropic 官方 API、公司 Claude 网关，以及公司网关把 Anthropic 协议映射到 DeepSeek 等模型的场景。
 - `OpenAI-compatible`：用于 OpenAI Responses API。服务地址填 `https://api.openai.com`，凭证填 OpenAI API key。
 
 CLI 也可以临时覆盖：

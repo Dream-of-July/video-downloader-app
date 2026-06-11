@@ -110,9 +110,12 @@ struct SettingsView: View {
                 Spacer(minLength: 0)
             }
             if case .loaded(let models) = modelFetchState, !models.isEmpty {
+                // 手填了列表外的模型名时，把它并入选项，避免 Picker 选中值无对应 tag
+                let current = draft.translationModel
+                let options = (current.isEmpty || models.contains(current)) ? models : models + [current]
                 Picker("选择模型", selection: $draft.translationModel) {
                     Text("请选择").tag("")
-                    ForEach(models, id: \.self) { Text($0).tag($0) }
+                    ForEach(options, id: \.self) { Text($0).tag($0) }
                 }
                 .pickerStyle(.menu)
             }
@@ -168,10 +171,6 @@ struct SettingsView: View {
         }
     }
 
-    private var modelCandidates: [String] {
-        draft.translationProvider.modelCandidates
-    }
-
     private var credentialHelpText: String {
         switch draft.translationProvider {
         case .anthropic:
@@ -188,9 +187,10 @@ struct SettingsView: View {
         draft.translationBaseURL = draft.translationProvider.defaultBaseURL
     }
 
+    /// 切换协议后清空模型：不同协议/端点的模型列表不同，强制重新「拉取模型」选择，
+    /// 避免拿着上一个协议的模型名去撞 503。
     private func clearModelIfNeeded() {
         guard !draft.translationModel.isEmpty else { return }
-        guard !modelCandidates.contains(draft.translationModel) else { return }
         draft.translationModel = ""
     }
 

@@ -8,8 +8,10 @@ public func makeTranslator(settings: AppSettings) -> any SubtitleTranslator {
 
 // MARK: - SRT 解析与序列化
 
-/// 解析 SRT 文本为字幕条。容忍 BOM、CRLF、多行字幕文本、序号缺失（按顺序补号）；
-/// 时间行解析失败的块整块跳过。
+/// 解析 SRT 文本为字幕条。按时间行锚定切条（而非按空行切块）：
+/// YouTube 滚动字幕的文本里常夹空行/纯空白行，按空行切块会把后半句当成
+/// 没有时间行的孤块整体丢掉。容忍 BOM、CRLF、多行文本、序号缺失（按顺序补号）；
+/// 文本为空的条目直接丢弃。
 func parseSRT(_ raw: String) -> [SubtitleCue] {
     var text = raw
     if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
@@ -18,39 +20,47 @@ func parseSRT(_ raw: String) -> [SubtitleCue] {
         .replacingOccurrences(of: "\r", with: "\n")
         .components(separatedBy: "\n")
 
-    // 按空行切块
-    var blocks: [[String]] = []
-    var current: [String] = []
-    for line in lines {
-        if line.trimmingCharacters(in: .whitespaces).isEmpty {
-            if !current.isEmpty {
-                blocks.append(current)
-                current = []
-            }
-        } else {
-            current.append(line)
-        }
+    // 先找出所有时间行的位置；上一行若是纯数字则视为该条的显式序号。
+    struct Anchor {
+        let lineIndex: Int
+        let start: String
+        let end: String
+        let explicitIndex: Int?
+        let hasIndexLine: Bool
     }
-    if !current.isEmpty { blocks.append(current) }
+    var anchors: [Anchor] = []
+    for (i, line) in lines.enumerated() {
+        guard let (start, end) = parseSRTTimeLine(line) else { continue }
+        var explicit: Int?
+        if i > 0 {
+            explicit = Int(lines[i - 1].trimmingCharacters(in: .whitespaces))
+        }
+        anchors.append(Anchor(
+            lineIndex: i, start: start, end: end,
+            explicitIndex: explicit, hasIndexLine: explicit != nil
+        ))
+    }
 
     var cues: [SubtitleCue] = []
     var nextIndex = 1
-    for block in blocks {
-        var rest = block[...]
-        // 首行是纯数字且第二行是时间行 → 显式序号；否则视为序号缺失
-        var explicitIndex: Int?
-        if rest.count >= 2,
-           let first = rest.first,
-           let number = Int(first.trimmingCharacters(in: .whitespaces)),
-           block[1].contains("-->") {
-            explicitIndex = number
-            rest = rest.dropFirst()
+    for (a, anchor) in anchors.enumerated() {
+        // 文本范围：本条时间行之后 → 下一条的序号行（或时间行）之前
+        var textEnd = lines.count
+        if a + 1 < anchors.count {
+            let next = anchors[a + 1]
+            textEnd = next.hasIndexLine ? next.lineIndex - 1 : next.lineIndex
         }
-        guard let timeLine = rest.first,
-              let (start, end) = parseSRTTimeLine(timeLine) else { continue }
-        rest = rest.dropFirst()
-        let index = explicitIndex ?? nextIndex
-        cues.append(SubtitleCue(index: index, start: start, end: end, text: rest.joined(separator: "\n")))
+        let textStart = anchor.lineIndex + 1
+        guard textStart <= textEnd else { continue }
+        let textLines = lines[textStart..<textEnd]
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !textLines.isEmpty else { continue }
+        let index = anchor.explicitIndex ?? nextIndex
+        cues.append(SubtitleCue(
+            index: index, start: anchor.start, end: anchor.end,
+            text: textLines.joined(separator: "\n")
+        ))
         nextIndex = index + 1
     }
     return cues
@@ -100,7 +110,8 @@ func secondsToSRTTime(_ seconds: Double) -> String {
 /// (b) 去重叠：每条 end 截断到 min(自身 end, 下一条 start)，截断后 <0.3s 则设为 start+0.3s；
 /// (c) 按句合并（仅对滚动字幕启用）：相邻碎条拼接，遇句末标点 / 累积≥6s / 累积≥84 字符断句；
 /// (d) 防误伤：合并后条数 ≥ 原条数则放弃合并，只返回去重叠结果；
-/// (e) 滚动判定：原始相邻重叠率 > 50% 才启用合并，非滚动只去重叠。
+/// (e) 滚动判定（满足其一即按句合并）：时间戳重叠率 > 50%（样式 A），
+///     或相邻条文本重复率 > 30%（样式 B：两行滚动窗口，先做文本去重再合并）。
 func cleanCues(_ input: [SubtitleCue]) -> [SubtitleCue] {
     guard !input.isEmpty else { return input }
 
@@ -116,7 +127,7 @@ func cleanCues(_ input: [SubtitleCue]) -> [SubtitleCue] {
     guard !timed.isEmpty else { return input }
     timed.sort { $0.start != $1.start ? $0.start < $1.start : $0.order < $1.order }
 
-    // (e) 滚动判定：相邻条 start < 上一条 end 的比例 > 50%
+    // (e) 滚动判定一：时间戳重叠（样式 A）——相邻条 start < 上一条 end 的比例 > 50%
     var overlapCount = 0
     if timed.count >= 2 {
         for i in 1..<timed.count where timed[i].start < timed[i - 1].end {
@@ -124,7 +135,47 @@ func cleanCues(_ input: [SubtitleCue]) -> [SubtitleCue] {
         }
     }
     let overlapRatio = timed.count >= 2 ? Double(overlapCount) / Double(timed.count - 1) : 0
-    let isRolling = overlapRatio > 0.5
+
+    // (e2) 滚动判定二：文本重复（样式 B）——每条开头重复上一条的尾行
+    //（两行滚动窗口 + 10ms 过渡条，时间戳首尾相接不重叠，靠时间戳判不出来）。
+    func overlapPrefixCount(prev: [String], cur: [String]) -> Int {
+        var k = min(prev.count, cur.count)
+        while k > 0 {
+            if Array(prev.suffix(k)) == Array(cur.prefix(k)) { return k }
+            k -= 1
+        }
+        return 0
+    }
+    var textRepeatPairs = 0
+    if timed.count >= 2 {
+        for i in 1..<timed.count {
+            let prev = timed[i - 1].text.components(separatedBy: "\n")
+            let cur = timed[i].text.components(separatedBy: "\n")
+            if overlapPrefixCount(prev: prev, cur: cur) > 0 { textRepeatPairs += 1 }
+        }
+    }
+    let textRepeatRatio = timed.count >= 2 ? Double(textRepeatPairs) / Double(timed.count - 1) : 0
+
+    let isRolling = overlapRatio > 0.5 || textRepeatRatio > 0.3
+
+    // (a2) 样式 B 先做文本去重：删掉每条开头与上一条结尾重复的行，只留新增内容；
+    //      删空的条目（纯过渡条）整条丢弃。对照对象用上一条的「原始」行，因为
+    //      滚动窗口重复的是原文而非去重后的残句。阈值 0.3 防止误伤歌词等合法重复。
+    if textRepeatRatio > 0.3 {
+        var deduped: [Timed] = []
+        var prevOriginalLines: [String] = []
+        for item in timed {
+            let curLines = item.text.components(separatedBy: "\n")
+            let k = overlapPrefixCount(prev: prevOriginalLines, cur: curLines)
+            prevOriginalLines = curLines
+            let newLines = Array(curLines.dropFirst(k))
+            guard !newLines.isEmpty else { continue }
+            var copy = item
+            copy.text = newLines.joined(separator: "\n")
+            deduped.append(copy)
+        }
+        if !deduped.isEmpty { timed = deduped }
+    }
 
     // (b) 去重叠：end 截断到下一条 start，过短则补到 start+0.3s（但不越过下一条 start）
     let minDuration = 0.3
@@ -516,11 +567,13 @@ func sendOpenAIResponse(
 
 /// 设置面板「测试连接」：发一条迷你请求，返回模型回复文本。
 public func testTranslationConnection(settings: AppSettings) async throws -> String {
+    // 上限别给太小：推理型模型（gpt-5 / o 系列等）会先消耗思考 token，
+    // 16 会导致可见输出为空、把"连接正常"误报成失败。
     let reply = try await sendConfiguredMessage(
         settings: settings,
         system: nil,
         userContent: "请只回复两个字：正常",
-        maxTokens: 16
+        maxTokens: 1024
     )
     return reply.text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
@@ -533,7 +586,14 @@ public func listTranslationModels(settings: AppSettings) async throws -> [String
     guard !token.isEmpty else {
         throw VDLError.translateFailed("尚未配置 API 凭证，请先填写凭证再拉取模型。")
     }
-    let url = try endpointURL(baseURL: settings.translationBaseURL, endpointPath: "/v1/models")
+    var url = try endpointURL(baseURL: settings.translationBaseURL, endpointPath: "/v1/models")
+    // Anthropic 协议的 /v1/models 默认每页只回 20 条，不带 limit 会漏模型；
+    // OpenAI 与多数网关会忽略未知查询参数，统一加上无副作用。
+    if var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+       components.queryItems?.isEmpty != false {
+        components.queryItems = [URLQueryItem(name: "limit", value: "1000")]
+        url = components.url ?? url
+    }
     let host = (url.host ?? "").lowercased()
 
     var request = URLRequest(url: url)
@@ -599,6 +659,27 @@ private func dedupePreservingOrder(_ items: [String]) -> [String] {
         out.append(item)
     }
     return out
+}
+
+/// 调试辅助：只清洗不翻译（解析 → cleanCues → 序列化），输出 "<名>.clean.srt"。
+/// 供 vdl-cli clean-srt 在不调 LLM 的情况下验证字幕清洗效果。
+public func cleanSRTFile(at url: URL) throws -> (parsed: Int, cleaned: Int, output: URL) {
+    let raw: String
+    do {
+        raw = try String(contentsOf: url, encoding: .utf8)
+    } catch {
+        throw VDLError.translateFailed("无法读取字幕文件：\(url.lastPathComponent)")
+    }
+    let parsed = parseSRT(raw)
+    guard !parsed.isEmpty else {
+        throw VDLError.translateFailed("字幕文件里没有可识别的字幕内容。")
+    }
+    let cleaned = cleanCues(parsed)
+    let name = url.lastPathComponent
+    let stem = name.lowercased().hasSuffix(".srt") ? String(name.dropLast(4)) : name
+    let outputURL = url.deletingLastPathComponent().appendingPathComponent(stem + ".clean.srt")
+    try serializeSRT(cleaned).write(to: outputURL, atomically: true, encoding: .utf8)
+    return (parsed.count, cleaned.count, outputURL)
 }
 
 // MARK: - ConfiguredTranslator

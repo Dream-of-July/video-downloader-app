@@ -136,6 +136,9 @@ struct ContentView: View {
             Text("粘贴链接，下载网页里的视频")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            Text("一次粘贴多条链接会自动逐个解析并加入队列")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
             if let notice = model.enqueueNotice {
                 Text(notice)
                     .font(.caption)
@@ -152,8 +155,13 @@ struct ContentView: View {
         VStack(spacing: 14) {
             ProgressView()
                 .controlSize(.large)
-            Text("正在解析…")
+            Text(model.batchStatusText ?? "正在解析…")
                 .foregroundStyle(.secondary)
+            if model.batchStatusText != nil {
+                Text("解析完成的视频会按最高画质自动加入队列")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
             Button("取消") {
                 model.cancelParse()
             }

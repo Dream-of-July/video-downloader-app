@@ -16,6 +16,7 @@ let usageText = """
   vdl-cli download <url> --video-id <id> --format <formatID> \
 [--subs en,zh] [--auto-subs en] [--dest 路径]
   vdl-cli translate <srt路径> [--style bilingual|zh] [--provider anthropic|openai] [--base 服务地址] [--model 模型] [--token 凭证]
+  vdl-cli clean-srt <srt路径>          （只清洗不翻译，输出 <名>.clean.srt，便于检查清洗效果）
   vdl-cli burn <视频> <srt> [--max-height N | --keep-resolution]
   vdl-cli ping-llm [--provider anthropic|openai] [--base 服务地址] [--model 模型] [--token 凭证]
 
@@ -283,6 +284,16 @@ do {
         }
         printer.finish()
         print("译文文件：\(outputURL.path)")
+
+    case "clean-srt":
+        guard cliArguments.count >= 2 else {
+            printErr("缺少 srt 文件路径。\n" + usageText)
+            exit(1)
+        }
+        let srtURL = URL(fileURLWithPath: (cliArguments[1] as NSString).expandingTildeInPath)
+        let result = try cleanSRTFile(at: srtURL)
+        print("解析 \(result.parsed) 条 → 清洗后 \(result.cleaned) 条")
+        print("输出：\(result.output.path)")
 
     case "burn":
         guard cliArguments.count >= 3 else {

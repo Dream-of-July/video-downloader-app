@@ -55,6 +55,8 @@ final class ViewModel: ObservableObject {
     @Published var settingsNotice: String?
     /// 入队成功后的一行轻提示（如「已加入队列」）
     @Published var enqueueNotice: String?
+    /// 批量粘贴多链接时的进度文案（解析中显示，如「批量解析中（2/5）」）
+    @Published var batchStatusText: String?
     /// 触发器：自增时 ContentView 重新聚焦链接输入框（入队后方便继续粘贴）。
     @Published var requestUrlFocus = 0
 
@@ -111,6 +113,14 @@ final class ViewModel: ObservableObject {
     func parse() {
         let input = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty, !isParsing else { return }
+
+        // 一次粘贴多条链接：逐个解析并按默认选项（最高画质）自动加入队列
+        let urls = Self.extractURLs(from: input)
+        if urls.count > 1 {
+            processBatch(urls)
+            return
+        }
+
         guard let url = URL(string: input),
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
@@ -146,12 +156,131 @@ final class ViewModel: ObservableObject {
         }
     }
 
+    /// 从粘贴文本里提取全部 http(s) 链接（按空白/换行分隔，容忍尾随标点），保序去重。
+    static func extractURLs(from input: String) -> [String] {
+        var seen = Set<String>()
+        var urls: [String] = []
+        for raw in input.components(separatedBy: .whitespacesAndNewlines) {
+            let token = raw.trimmingCharacters(in: CharacterSet(charactersIn: ",;，；、"))
+            guard token.lowercased().hasPrefix("http"),
+                  let url = URL(string: token),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  url.host != nil,
+                  seen.insert(token).inserted else { continue }
+            urls.append(token)
+        }
+        return urls
+    }
+
+    /// 批量模式：逐个解析（多候选页取第一个，即页面主视频），按最高画质自动入队。
+    /// 当前已选「中文字幕」模式会沿用，并自动挑一条字幕作翻译源（真实字幕优先）。
+    private func processBatch(_ urls: [String]) {
+        let mode = chineseMode
+        if mode != .off, !settings.isTranslationConfigured {
+            settingsNotice = "请先配置翻译服务"
+            showSettings = true
+            return
+        }
+        session += 1
+        let token = session
+        retryAction = nil
+        failedNeedsLogin = nil
+        enqueueNotice = nil
+        candidates = []
+        chosenCandidate = nil
+        stage = .resolving
+        let currentSettings = settings
+        parseTask = Task {
+            var added = 0
+            var duplicated = 0
+            var failedHosts: [String] = []
+            for (index, urlString) in urls.enumerated() {
+                guard token == self.session else { return }
+                self.batchStatusText = "批量解析中（\(index + 1)/\(urls.count)）"
+                do {
+                    let found = try await self.engine.resolveCandidates(for: urlString)
+                    guard token == self.session else { return }
+                    guard let candidate = found.first else { throw VDLError.sniffFailed("") }
+                    var info = try await self.engine.analyze(url: candidate.url)
+                    guard token == self.session else { return }
+                    if candidate.kind == .pageMain || candidate.kind == .directFile,
+                       !candidate.title.isEmpty, candidate.title != info.title {
+                        info = VideoInfo(
+                            sourceURL: info.sourceURL, videoID: info.videoID, title: candidate.title,
+                            durationText: info.durationText, thumbnailURL: info.thumbnailURL,
+                            uploader: info.uploader, formats: info.formats, subtitles: info.subtitles
+                        )
+                    }
+                    guard let formatID = info.formats.first?.id else {
+                        throw VDLError.analyzeFailed("没有可用格式")
+                    }
+                    if self.queue.hasOpenDuplicate(
+                        videoID: info.videoID, sourceURL: info.sourceURL, formatID: formatID
+                    ) {
+                        duplicated += 1
+                        continue
+                    }
+                    // 中文字幕模式开启时自动选一条字幕作翻译源（真实字幕优先）
+                    var subtitleLangs: [String] = []
+                    var autoSubtitleLangs: [String] = []
+                    if mode != .off,
+                       let sub = info.subtitles.first(where: { !$0.isAuto }) ?? info.subtitles.first {
+                        if sub.isAuto {
+                            autoSubtitleLangs = [sub.id]
+                        } else {
+                            subtitleLangs = [sub.id]
+                        }
+                    }
+                    let request = DownloadRequest(
+                        url: info.sourceURL,
+                        videoID: info.videoID,
+                        formatID: formatID,
+                        subtitleLangs: subtitleLangs,
+                        autoSubtitleLangs: autoSubtitleLangs,
+                        destinationDirectory: FileManager.default.urls(
+                            for: .downloadsDirectory, in: .userDomainMask
+                        )[0],
+                        preferredTitle: (candidate.kind == .pageMain || candidate.kind == .directFile)
+                            ? info.title : nil
+                    )
+                    self.queue.enqueue(
+                        info: info, request: request, chineseMode: mode, settings: currentSettings
+                    )
+                    added += 1
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard token == self.session else { return }
+                    if case VDLError.cancelled = error { return }
+                    failedHosts.append(URL(string: urlString)?.host ?? urlString)
+                }
+            }
+            guard token == self.session else { return }
+            self.batchStatusText = nil
+            self.urlText = ""
+            self.selectedFormatID = nil
+            self.selectedSubtitleIDs = []
+            self.chineseMode = .off
+            self.stage = .idle
+            var parts: [String] = ["已加入 \(added) 个任务"]
+            if duplicated > 0 { parts.append("\(duplicated) 个已在队列") }
+            if !failedHosts.isEmpty {
+                let sample = failedHosts.prefix(2).joined(separator: "、")
+                parts.append("\(failedHosts.count) 个解析失败：\(sample)\(failedHosts.count > 2 ? " 等" : "")")
+            }
+            self.enqueueNotice = parts.joined(separator: "；")
+            self.requestUrlFocus += 1
+        }
+    }
+
     func cancelParse() {
         switch stage {
         case .resolving:
             session += 1
             parseTask?.cancel()
             parseTask = nil
+            batchStatusText = nil
             stage = .idle
         case .analyzing:
             session += 1
