@@ -319,7 +319,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 throw loginError
             }
             if Self.isYouTubeHost(url.host ?? "") {
-                throw VDLError.analyzeFailed(Self.summarizeStderr(stderr))
+                throw VDLError.analyzeFailed(Self.friendlyAnalyzeMessage(stderr))
             }
             let candidates: [VideoCandidate]
             do {
@@ -352,7 +352,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 if let loginError = Self.detectLoginRequired(stderr: stderr, url: trimmed) {
                     throw loginError
                 }
-                throw VDLError.analyzeFailed(Self.summarizeStderr(stderr))
+                throw VDLError.analyzeFailed(Self.friendlyAnalyzeMessage(stderr))
             }
         }
         return await buildVideoInfo(sourceURL: trimmed, json: json)
@@ -366,27 +366,39 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     private func runYtDlpJSON(for url: String) async throws -> YtDlpJSONResult {
         let ytdlp = try ytDlpPath()
         let ffmpegDir = try ffmpegDirectory()
-        let output = try await Self.runProcess(
-            executable: ytdlp,
-            arguments: ["-J", "--no-playlist", "--ffmpeg-location", ffmpegDir]
-                + Self.cookieArguments() + [url],
-            timeout: 60
-        )
-        if output.timedOut {
-            throw VDLError.analyzeFailed("解析超时，请检查网络后重试")
-        }
-        if output.status == 0,
-           let object = try? JSONSerialization.jsonObject(with: output.stdout),
-           var dict = object as? [String: Any] {
-            // --no-playlist 之下仍可能拿到 playlist 包装，取第一个条目兜底。
-            if dict["_type"] as? String == "playlist",
-               let entries = dict["entries"] as? [[String: Any]],
-               let first = entries.first {
-                dict = first
+        var lastStderr = ""
+        for attempt in 0..<2 {
+            let output = try await Self.runProcess(
+                executable: ytdlp,
+                arguments: ["-J", "--no-playlist", "--ffmpeg-location", ffmpegDir]
+                    + Self.cookieArguments() + [url],
+                timeout: 60
+            )
+            if output.timedOut {
+                throw VDLError.analyzeFailed("解析超时，请检查网络后重试")
             }
-            return .success(dict)
+            if output.status == 0,
+               let object = try? JSONSerialization.jsonObject(with: output.stdout),
+               var dict = object as? [String: Any] {
+                // --no-playlist 之下仍可能拿到 playlist 包装，取第一个条目兜底。
+                if dict["_type"] as? String == "playlist",
+                   let entries = dict["entries"] as? [[String: Any]],
+                   let first = entries.first {
+                    dict = first
+                }
+                return .success(dict)
+            }
+            lastStderr = String(decoding: output.stderr, as: UTF8.self)
+            // YouTube 偶发返回空格式列表（"Requested format is not available"），
+            // 属临时风控，隔 2 秒自动重试一次。
+            if attempt == 0, lastStderr.contains("Requested format is not available") {
+                do { try await Task.sleep(nanoseconds: 2_000_000_000) }
+                catch { throw VDLError.cancelled }
+                continue
+            }
+            break
         }
-        return .failure(stderr: String(decoding: output.stderr, as: UTF8.self))
+        return .failure(stderr: lastStderr)
     }
 
     private func buildVideoInfo(sourceURL: String, json: [String: Any]) async -> VideoInfo {
@@ -909,6 +921,14 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         return h == "youtu.be"
             || h == "youtube.com" || h.hasSuffix(".youtube.com")
             || h == "youtube-nocookie.com" || h.hasSuffix(".youtube-nocookie.com")
+    }
+
+    /// 解析阶段错误的中文化（自动重试一次后仍失败才会走到这里）。
+    private static func friendlyAnalyzeMessage(_ stderr: String) -> String {
+        if stderr.contains("Requested format is not available") {
+            return "站点暂时没有返回可用的清晰度（多为临时风控），请稍后重试；若反复出现，可在设置里重新登录。"
+        }
+        return summarizeStderr(stderr)
     }
 
     private static func summarizeStderr(_ text: String) -> String {
