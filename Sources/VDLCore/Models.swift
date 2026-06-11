@@ -221,7 +221,7 @@ public struct SubtitleCue: Sendable {
 }
 
 /// 字幕翻译器。默认实现 `ConfiguredTranslator`（Translator.swift）：
-/// 按设置选择 Anthropic Messages API 或 OpenAI Responses API 调用配置的模型。
+/// 按设置选择 Anthropic/DeepSeek Messages API 或 OpenAI Responses API 调用配置的模型。
 /// 用 `makeTranslator(settings:)` 获取实例。
 public protocol SubtitleTranslator: Sendable {
     /// 把 srt 文件翻译成中文，按 style 生成新 srt（双语：中文在上原文在下；仅中文：替换原文），

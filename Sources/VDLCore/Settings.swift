@@ -12,6 +12,24 @@ public enum TranslationProvider: String, Codable, Sendable, Equatable, CaseItera
             return "https://api.openai.com"
         }
     }
+
+    public var modelCandidates: [String] {
+        switch self {
+        case .anthropic:
+            return [
+                "deepseek-v4-flash",
+                "deepseek-v4-pro",
+                "claude-haiku-4-5",
+                "claude-sonnet-4-5",
+                "claude-opus-4-5",
+            ]
+        case .openai:
+            return [
+                "gpt-5.4",
+                "gpt-4.1",
+            ]
+        }
+    }
 }
 
 /// App 设置。持久化在 ~/Library/Application Support/视频下载器/settings.json（0600）。
@@ -74,7 +92,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         translationBaseURL = try c.decodeIfPresent(String.self, forKey: .translationBaseURL)
             ?? TranslationProvider.anthropic.defaultBaseURL
         translationModel = try c.decodeIfPresent(String.self, forKey: .translationModel) ?? ""
-        translationProvider = try c.decodeIfPresent(TranslationProvider.self, forKey: .translationProvider)
+        let rawProvider = try c.decodeIfPresent(String.self, forKey: .translationProvider)
+        translationProvider = rawProvider.flatMap { TranslationProvider(rawValue: $0) }
             ?? Self.inferProvider(baseURL: translationBaseURL, model: translationModel)
         translationAuthToken = try c.decodeIfPresent(String.self, forKey: .translationAuthToken) ?? ""
         subtitleStyle = try c.decodeIfPresent(SubtitleStyle.self, forKey: .subtitleStyle) ?? .bilingual
@@ -115,6 +134,12 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var isTranslationConfigured: Bool {
         !translationBaseURL.trimmingCharacters(in: .whitespaces).isEmpty
             && !translationModel.trimmingCharacters(in: .whitespaces).isEmpty
+            && !translationAuthToken.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// 已填好服务地址和凭证，但模型可以稍后从候选菜单里选择。
+    public var isTranslationEndpointConfigured: Bool {
+        !translationBaseURL.trimmingCharacters(in: .whitespaces).isEmpty
             && !translationAuthToken.trimmingCharacters(in: .whitespaces).isEmpty
     }
 

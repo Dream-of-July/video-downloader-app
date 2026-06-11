@@ -285,6 +285,17 @@ private func responseErrorMessage(from data: Data) -> String {
     return decoded ?? (fallback.isEmpty ? "请求失败" : fallback)
 }
 
+private func requestFailureMessage(statusCode: Int, data: Data, settings: AppSettings) -> String {
+    let message = responseErrorMessage(from: data)
+    let lowerMessage = message.lowercased()
+    guard statusCode == 503 || lowerMessage.contains("no available accounts") else {
+        return "HTTP \(statusCode)：\(message)"
+    }
+
+    let model = settings.translationModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    return "HTTP \(statusCode)：网关没有可用账号或模型映射未命中。请确认模型名 \(model.isEmpty ? "已填写" : "「\(model)」") 在公司网关里已登记——点「拉取模型」选一个网关实际提供的模型。原始错误：\(message)"
+}
+
 /// 调一次 Anthropic Messages API，返回回复里所有 type=="text" 块拼接后的文本。
 /// 429/5xx 指数退避重试最多 2 次（2s、8s）；其余错误映射为 VDLError。
 func sendAnthropicMessage(
@@ -368,7 +379,11 @@ func sendAnthropicMessage(
                 attempt += 1
                 continue
             }
-            throw VDLError.translateFailed("HTTP \(http.statusCode)：\(responseErrorMessage(from: data))")
+            throw VDLError.translateFailed(requestFailureMessage(
+                statusCode: http.statusCode,
+                data: data,
+                settings: settings
+            ))
         } catch let error as VDLError {
             throw error
         } catch is CancellationError {
@@ -479,7 +494,11 @@ func sendOpenAIResponse(
                 attempt += 1
                 continue
             }
-            throw VDLError.translateFailed("HTTP \(http.statusCode)：\(responseErrorMessage(from: data))")
+            throw VDLError.translateFailed(requestFailureMessage(
+                statusCode: http.statusCode,
+                data: data,
+                settings: settings
+            ))
         } catch let error as VDLError {
             throw error
         } catch is CancellationError {
@@ -504,6 +523,82 @@ public func testTranslationConnection(settings: AppSettings) async throws -> Str
         maxTokens: 16
     )
     return reply.text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// 拉取服务端可用模型列表（GET {baseURL}/v1/models）。
+/// 官方 Anthropic 与 OpenAI、以及大多数企业网关都暴露这个端点；返回模型 id 数组。
+/// 只需服务地址 + 凭证，不需要先填模型。
+public func listTranslationModels(settings: AppSettings) async throws -> [String] {
+    let token = normalizedToken(settings.translationAuthToken)
+    guard !token.isEmpty else {
+        throw VDLError.translateFailed("尚未配置 API 凭证，请先填写凭证再拉取模型。")
+    }
+    let url = try endpointURL(baseURL: settings.translationBaseURL, endpointPath: "/v1/models")
+    let host = (url.host ?? "").lowercased()
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.timeoutInterval = 20
+    // 同时带两种鉴权头以兼容网关；官方 Anthropic 只认 x-api-key + version。
+    request.setValue(token, forHTTPHeaderField: "x-api-key")
+    if host != "api.anthropic.com" {
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+    request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+
+    do {
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw VDLError.translateFailed("拉取模型列表失败：无效响应。")
+        }
+        guard http.statusCode == 200 else {
+            throw VDLError.translateFailed(requestFailureMessage(
+                statusCode: http.statusCode, data: data, settings: settings
+            ))
+        }
+        let ids = parseModelIDs(from: data)
+        guard !ids.isEmpty else {
+            throw VDLError.translateFailed("服务返回的模型列表为空，请手动填写模型名。")
+        }
+        return ids
+    } catch let error as VDLError {
+        throw error
+    } catch let error as URLError {
+        if error.code == .cancelled { throw VDLError.cancelled }
+        throw VDLError.translateFailed("无法连接到翻译服务，请检查服务地址和网络。")
+    } catch {
+        throw VDLError.translateFailed(error.localizedDescription)
+    }
+}
+
+/// 解析 /v1/models 响应。兼容 OpenAI 风格 {"data":[{"id":...}]} 与 Anthropic 风格
+/// {"data":[{"id":...,"type":"model"}]}，以及个别网关的 {"models":[...]} / 纯数组。
+private func parseModelIDs(from data: Data) -> [String] {
+    guard let obj = try? JSONSerialization.jsonObject(with: data) else { return [] }
+    func ids(from arr: [Any]) -> [String] {
+        arr.compactMap { entry in
+            if let s = entry as? String { return s }
+            if let d = entry as? [String: Any] {
+                return (d["id"] as? String) ?? (d["name"] as? String) ?? (d["model"] as? String)
+            }
+            return nil
+        }
+    }
+    if let dict = obj as? [String: Any] {
+        if let arr = dict["data"] as? [Any] { return dedupePreservingOrder(ids(from: arr)) }
+        if let arr = dict["models"] as? [Any] { return dedupePreservingOrder(ids(from: arr)) }
+    }
+    if let arr = obj as? [Any] { return dedupePreservingOrder(ids(from: arr)) }
+    return []
+}
+
+private func dedupePreservingOrder(_ items: [String]) -> [String] {
+    var seen = Set<String>()
+    var out: [String] = []
+    for item in items where !item.isEmpty && seen.insert(item).inserted {
+        out.append(item)
+    }
+    return out
 }
 
 // MARK: - ConfiguredTranslator

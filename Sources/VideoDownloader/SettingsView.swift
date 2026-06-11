@@ -16,9 +16,18 @@ struct SettingsView: View {
         case failure(String)
     }
 
+    private enum ModelFetchState: Equatable {
+        case idle
+        case fetching
+        case loaded([String])
+        case failure(String)
+    }
+
     @State private var draft = AppSettings()
     @State private var testState: TestState = .idle
     @State private var testTask: Task<Void, Never>?
+    @State private var modelFetchState: ModelFetchState = .idle
+    @State private var modelFetchTask: Task<Void, Never>?
     @State private var clearFeedback: String?
     @State private var showClearConfirm = false
     /// cookies.txt 的修改日期；nil 表示尚未登录任何站点
@@ -36,11 +45,13 @@ struct SettingsView: View {
             // 任一字段被改动：上一次的测试结果不再可信，回到初始态。
             .onChange(of: draft.translationProvider) {
                 updateBaseURLForProviderChange()
+                clearModelIfNeeded()
                 resetTestState()
+                resetModelFetch()
             }
-            .onChange(of: draft.translationBaseURL) { resetTestState() }
+            .onChange(of: draft.translationBaseURL) { resetTestState(); resetModelFetch() }
             .onChange(of: draft.translationModel) { resetTestState() }
-            .onChange(of: draft.translationAuthToken) { resetTestState() }
+            .onChange(of: draft.translationAuthToken) { resetTestState(); resetModelFetch() }
             Divider()
             bottomBar
         }
@@ -51,6 +62,7 @@ struct SettingsView: View {
         }
         .onDisappear {
             testTask?.cancel()
+            modelFetchTask?.cancel()
             // 未点「完成」时回滚为磁盘值；已保存时 reload 等价于当前值，无副作用。
             model.settings = AppSettings.load()
         }
@@ -61,19 +73,13 @@ struct SettingsView: View {
     private var translationSection: some View {
         Section("翻译服务") {
             Picker("接口协议", selection: $draft.translationProvider) {
-                Text("Anthropic / Claude").tag(TranslationProvider.anthropic)
-                Text("OpenAI").tag(TranslationProvider.openai)
+                Text("Anthropic-compatible").tag(TranslationProvider.anthropic)
+                Text("OpenAI-compatible").tag(TranslationProvider.openai)
             }
             TextField(
                 "服务地址",
                 text: $draft.translationBaseURL,
                 prompt: Text(baseURLPrompt)
-            )
-            .autocorrectionDisabled()
-            TextField(
-                "模型名",
-                text: $draft.translationModel,
-                prompt: Text(modelPrompt)
             )
             .autocorrectionDisabled()
             VStack(alignment: .leading, spacing: 4) {
@@ -82,6 +88,41 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // 模型：先填地址+凭证，点「拉取模型」从服务端取真实可用列表再选。
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Button("拉取模型") { fetchModels() }
+                    .buttonStyle(.bordered)
+                    .disabled(modelFetchState == .fetching
+                        || draft.translationBaseURL.trimmingCharacters(in: .whitespaces).isEmpty
+                        || draft.translationAuthToken.trimmingCharacters(in: .whitespaces).isEmpty)
+                switch modelFetchState {
+                case .idle:
+                    EmptyView()
+                case .fetching:
+                    ProgressView().controlSize(.small)
+                case .loaded(let models):
+                    Text("已拉取 \(models.count) 个模型")
+                        .font(.caption).foregroundStyle(.secondary)
+                case .failure(let message):
+                    Text(message)
+                        .font(.caption).foregroundStyle(.red).lineLimit(3)
+                }
+                Spacer(minLength: 0)
+            }
+            if case .loaded(let models) = modelFetchState, !models.isEmpty {
+                Picker("选择模型", selection: $draft.translationModel) {
+                    Text("请选择").tag("")
+                    ForEach(models, id: \.self) { Text($0).tag($0) }
+                }
+                .pickerStyle(.menu)
+            }
+            // 拉不到列表时仍允许手填
+            TextField(
+                "模型名（也可手动填写）",
+                text: $draft.translationModel,
+                prompt: Text(modelPrompt)
+            )
+            .autocorrectionDisabled()
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Button("测试连接") {
                     runConnectionTest()
@@ -112,7 +153,7 @@ struct SettingsView: View {
     private var baseURLPrompt: String {
         switch draft.translationProvider {
         case .anthropic:
-            return "https://api.anthropic.com 或企业网关地址"
+            return "Anthropic 兼容地址或企业网关地址"
         case .openai:
             return "https://api.openai.com"
         }
@@ -121,16 +162,20 @@ struct SettingsView: View {
     private var modelPrompt: String {
         switch draft.translationProvider {
         case .anthropic:
-            return "例如 claude-haiku-4-5 / 网关模型名"
+            return "可先留空，填完地址和凭证后选择"
         case .openai:
-            return "例如 gpt-5.4 / gpt-4.1"
+            return "可先留空，填完地址和凭证后选择"
         }
+    }
+
+    private var modelCandidates: [String] {
+        draft.translationProvider.modelCandidates
     }
 
     private var credentialHelpText: String {
         switch draft.translationProvider {
         case .anthropic:
-            return "公司网关按 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 填写；只填凭证本身，不要带 Bearer 前缀。"
+            return "公司网关按 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 填写；DeepSeek 映射也选这个协议。"
         case .openai:
             return "OpenAI 使用 Responses API。服务地址填 https://api.openai.com；凭证填 OpenAI API key，不要带 Bearer 前缀。"
         }
@@ -141,6 +186,12 @@ struct SettingsView: View {
         let defaultURLs = Set(TranslationProvider.allCases.map(\.defaultBaseURL))
         guard trimmed.isEmpty || defaultURLs.contains(trimmed) else { return }
         draft.translationBaseURL = draft.translationProvider.defaultBaseURL
+    }
+
+    private func clearModelIfNeeded() {
+        guard !draft.translationModel.isEmpty else { return }
+        guard !modelCandidates.contains(draft.translationModel) else { return }
+        draft.translationModel = ""
     }
 
     /// 任一字段被改动：上一次的测试结果不再可信，回到初始态。
@@ -168,6 +219,38 @@ struct SettingsView: View {
                     reason = error.localizedDescription
                 }
                 testState = .failure("连接失败：\(reason)")
+            }
+        }
+    }
+
+    private func resetModelFetch() {
+        guard modelFetchState != .idle else { return }
+        modelFetchTask?.cancel()
+        modelFetchState = .idle
+    }
+
+    private func fetchModels() {
+        modelFetchTask?.cancel()
+        modelFetchState = .fetching
+        let settings = draft
+        modelFetchTask = Task {
+            do {
+                let models = try await listTranslationModels(settings: settings)
+                guard !Task.isCancelled else { return }
+                modelFetchState = .loaded(models)
+                // 当前模型不在列表里就清空，促使用户从列表选一个网关真有的模型。
+                if !draft.translationModel.isEmpty, !models.contains(draft.translationModel) {
+                    draft.translationModel = ""
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                let reason: String
+                if case VDLError.translateFailed(let detail) = error {
+                    reason = detail
+                } else {
+                    reason = error.localizedDescription
+                }
+                modelFetchState = .failure("拉取失败：\(reason)")
             }
         }
     }

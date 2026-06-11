@@ -35,15 +35,16 @@ swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli download <url> --vid
 
 ## 字幕翻译 API
 
-设置页支持两种接口协议：
+设置页支持两种接口协议，模型名可以先留空；填好服务地址和凭证后，从“可选模型”里选：
 
-- `Anthropic / Claude`：用于 Anthropic 官方 API 或公司 Claude 网关。公司网关按 `ANTHROPIC_BASE_URL` 填服务地址，按 `ANTHROPIC_AUTH_TOKEN` 填凭证。
-- `OpenAI`：用于 OpenAI Responses API。服务地址填 `https://api.openai.com`，模型填 OpenAI 模型名，凭证填 OpenAI API key。
+- `Anthropic-compatible`：用于 Anthropic 官方 API、公司 Claude 网关，以及公司网关把 Anthropic 协议映射到 DeepSeek 的场景。DeepSeek 映射优先试 `deepseek-v4-flash` / `deepseek-v4-pro`。
+- `OpenAI-compatible`：用于 OpenAI Responses API。服务地址填 `https://api.openai.com`，凭证填 OpenAI API key。
 
 CLI 也可以临时覆盖：
 
 ```sh
 swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli ping-llm --provider anthropic --base "$ANTHROPIC_BASE_URL" --model claude-haiku-4-5 --token "$ANTHROPIC_AUTH_TOKEN"
+swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli ping-llm --provider anthropic --base "$ANTHROPIC_BASE_URL" --model deepseek-v4-flash --token "$ANTHROPIC_AUTH_TOKEN"
 swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli ping-llm --provider openai --base https://api.openai.com --model gpt-5.4 --token "$OPENAI_API_KEY"
 ```
 
