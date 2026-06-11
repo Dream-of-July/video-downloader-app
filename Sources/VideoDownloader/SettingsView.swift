@@ -39,6 +39,7 @@ struct SettingsView: View {
                 translationSection
                 styleSection
                 burnQualitySection
+                performanceSection
                 loginSection
             }
             .formStyle(.grouped)
@@ -177,6 +178,34 @@ struct SettingsView: View {
             return "公司网关按 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 填写；DeepSeek 映射也选这个协议。"
         case .openai:
             return "OpenAI 使用 Responses API。服务地址填 https://api.openai.com；凭证填 OpenAI API key，不要带 Bearer 前缀。"
+        }
+    }
+
+    // MARK: - 性能
+
+    private var performanceSection: some View {
+        Section("性能") {
+            Stepper(value: $draft.maxConcurrentDownloads, in: 1...5) {
+                HStack {
+                    Text("同时下载数")
+                    Spacer()
+                    Text("\(draft.maxConcurrentDownloads)")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            Stepper(value: $draft.maxConcurrentBurns, in: 1...3) {
+                HStack {
+                    Text("同时压制数")
+                    Spacer()
+                    Text("\(draft.maxConcurrentBurns)")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            Text("超出上限的任务显示「排队中」自动等待；暂停一个任务会把空位让给下一个。压制很吃 CPU，并行过多会互相拖慢。保存后即对新开始的阶段生效。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -352,7 +381,8 @@ struct SettingsView: View {
         clearFeedback = nil
         NetscapeCookieFile.clear(at: AppSettings.cookieFileURL)
         WKWebsiteDataStore.default().removeData(
-            ofTypes: [WKWebsiteDataTypeCookies],
+            ofTypes: [WKWebsiteDataTypeCookies, WKWebsiteDataTypeLocalStorage,
+                      WKWebsiteDataTypeIndexedDBDatabases, WKWebsiteDataTypeSessionStorage],
             modifiedSince: .distantPast
         ) {
             clearFeedback = "已清除"

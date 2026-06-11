@@ -64,7 +64,8 @@ struct QueueItemView: View {
         if item.isPaused { return "已暂停" }
         switch item.stage {
         case .queued:
-            return "排队中…"
+            // 等槽位/等待恢复等具体原因（QueueManager 写入），没有就显示通用文案
+            return item.statusText ?? "排队中…"
         case .downloading:
             if item.isPostDownloadProcessing { return "处理中…" }
             if let p = item.progress { return "下载中 \(Int(p * 100))%" }
@@ -128,6 +129,10 @@ struct QueueItemView: View {
             }
         case .done:
             HStack(spacing: 6) {
+                if item.partialFailure {
+                    // 部分成功（视频已下载、字幕处理失败）：只重跑字幕处理，不重新下载
+                    iconButton("arrow.clockwise", help: "重试字幕处理", action: onRetry)
+                }
                 if !item.resultFiles.isEmpty {
                     iconButton("folder", help: "在访达中显示", action: onReveal)
                 }

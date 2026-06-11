@@ -31,6 +31,10 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// 烧录时限制最大分辨率高度：源高于此值则缩放到此值（既快又小，避开 4K60 的 H.264 上限）。
     /// nil = 保持源分辨率。默认 1080。
     public var maxBurnHeight: Int?
+    /// 同时进行的下载任务数（1...5，默认 3）。
+    public var maxConcurrentDownloads: Int
+    /// 同时进行的压制（烧录）任务数（1...3，默认 2）。压制吃满 CPU，并行多了互相拖慢。
+    public var maxConcurrentBurns: Int
 
     public init(
         translationProvider: TranslationProvider = .anthropic,
@@ -38,7 +42,9 @@ public struct AppSettings: Codable, Sendable, Equatable {
         translationModel: String = "",
         translationAuthToken: String = "",
         subtitleStyle: SubtitleStyle = .bilingual,
-        maxBurnHeight: Int? = 1080
+        maxBurnHeight: Int? = 1080,
+        maxConcurrentDownloads: Int = 3,
+        maxConcurrentBurns: Int = 2
     ) {
         self.translationProvider = translationProvider
         self.translationBaseURL = translationBaseURL
@@ -46,6 +52,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.translationAuthToken = translationAuthToken
         self.subtitleStyle = subtitleStyle
         self.maxBurnHeight = maxBurnHeight
+        self.maxConcurrentDownloads = maxConcurrentDownloads
+        self.maxConcurrentBurns = maxConcurrentBurns
     }
 
     // MARK: 存储位置
@@ -68,6 +76,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case translationProvider, translationBaseURL, translationModel, translationAuthToken, subtitleStyle, maxBurnHeight
+        case maxConcurrentDownloads, maxConcurrentBurns
     }
 
     public init(from decoder: Decoder) throws {
@@ -86,6 +95,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
         } else {
             maxBurnHeight = 1080
         }
+        // 并发数：缺失按默认，读入时夹回合法区间
+        let downloads = try c.decodeIfPresent(Int.self, forKey: .maxConcurrentDownloads) ?? 3
+        maxConcurrentDownloads = min(max(downloads, 1), 5)
+        let burns = try c.decodeIfPresent(Int.self, forKey: .maxConcurrentBurns) ?? 2
+        maxConcurrentBurns = min(max(burns, 1), 3)
     }
 
     public static func load() -> AppSettings {
@@ -103,13 +117,26 @@ public struct AppSettings: Codable, Sendable, Equatable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(self)
         let url = Self.settingsFileURL
-        // 一步创建并带 0600 权限，避免「先 0644 落盘再收紧」的窗口（文件含凭证）
+        // 先写临时文件再原子替换：写失败时旧配置（含凭证）原样保留，不能像以前那样
+        // 删旧文件导致磁盘满/权限问题时配置全丢。临时文件一步创建即 0600。
+        let temp = dir.appendingPathComponent("settings.json.tmp-\(UUID().uuidString)")
+        #if os(Windows)
+        let attributes: [FileAttributeKey: Any]? = nil
+        #else
+        let attributes: [FileAttributeKey: Any]? = [.posixPermissions: 0o600]
+        #endif
         guard FileManager.default.createFile(
-            atPath: url.path, contents: data,
-            attributes: [.posixPermissions: 0o600]
+            atPath: temp.path, contents: data,
+            attributes: attributes
         ) else {
-            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: temp)
             throw CocoaError(.fileWriteUnknown)
+        }
+        do {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: temp)
+        } catch {
+            try? FileManager.default.removeItem(at: temp)
+            throw error
         }
     }
 

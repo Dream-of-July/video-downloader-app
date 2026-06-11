@@ -14,6 +14,24 @@ public struct FFmpegBurner: SubtitleBurner {
 
     public init() {}
 
+    #if os(Windows)
+    /// Windows：沿 PATH 找 ffmpeg.exe（官方 full 构建自带 libass）。
+    private static func locate(_ name: String) -> String? {
+        let fm = FileManager.default
+        let env = ProcessInfo.processInfo.environment
+        if name == "ffmpeg", let custom = env["VDL_BURN_FFMPEG_PATH"],
+           !custom.isEmpty, fm.isExecutableFile(atPath: custom) {
+            return custom
+        }
+        let exe = name.lowercased().hasSuffix(".exe") ? name : name + ".exe"
+        let pathValue = env.first { $0.key.lowercased() == "path" }?.value ?? ""
+        for dir in pathValue.split(separator: ";") {
+            let candidate = String(dir) + "\\" + exe
+            if fm.isExecutableFile(atPath: candidate) { return candidate }
+        }
+        return nil
+    }
+    #else
     // 烧录需要带 libass 的 ffmpeg（subtitles 滤镜）。Homebrew 镜像的 ffmpeg 可能是
     // 无 libass 的精简版，因此优先找 keg-only 的 ffmpeg-full。
     private static let searchPaths = [
@@ -39,6 +57,16 @@ public struct FFmpegBurner: SubtitleBurner {
             if FileManager.default.isExecutableFile(atPath: path) { return path }
         }
         return nil
+    }
+    #endif
+
+    /// 平台中文字体：macOS 苹方，Windows 微软雅黑。
+    static var chineseFontName: String {
+        #if os(Windows)
+        return "Microsoft YaHei"
+        #else
+        return "PingFang SC"
+        #endif
     }
 
     public func burn(
@@ -73,7 +101,8 @@ public struct FFmpegBurner: SubtitleBurner {
         //    规避 subtitles 滤镜对路径里冒号/引号/中文的转义问题。
         //    用 ASS 而非 SRT 是为了双语两种字号：中文（首行）正常字号，原文（次行）更小。
         let fm = FileManager.default
-        let tempDir = URL(fileURLWithPath: "/tmp/vdl-burn-\(UUID().uuidString)", isDirectory: true)
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vdl-burn-\(UUID().uuidString)", isDirectory: true)
         // 缩放滤镜：-2 让宽度自动按比例取偶数，避免 H.264 要求偶数边长报错。
         let scaleFilter = targetHeight.map { "scale=-2:\($0)" }
         let filter: String
@@ -86,7 +115,7 @@ public struct FFmpegBurner: SubtitleBurner {
                 // 解析不出来就按原样走 SRT + force_style 的老路
                 try fm.copyItem(at: subtitle, to: tempDir.appendingPathComponent("subs.srt"))
                 subtitleFilter = "subtitles=subs.srt:force_style="
-                    + "'FontName=PingFang SC,FontSize=15,Outline=1,Shadow=0,MarginV=20'"
+                    + "'FontName=\(Self.chineseFontName),FontSize=15,Outline=1,Shadow=0,MarginV=20'"
             } else {
                 let ass = Self.makeASS(cues: cues)
                 try ass.write(
@@ -129,22 +158,29 @@ public struct FFmpegBurner: SubtitleBurner {
         //    onStart 登记 pid 到 control：暂停时向 ffmpeg 进程树发 SIGSTOP/SIGCONT。
         let totalSeconds = probe.duration
         func run(_ arguments: [String]) async throws -> (status: Int32, stderrTail: String) {
-            try await YtDlpEngine.runStreamingProcess(
-                executable: ffmpeg,
-                arguments: arguments,
-                currentDirectory: tempDir,
-                onStart: { pid in
-                    if control?.isCancelled == true {
-                        // 启动瞬间已取消：立即终止进程树。
-                        TaskControlToken.signalTree(pid, SIGKILL)
-                    } else {
-                        control?.setActivePID(pid)
+            do {
+                return try await YtDlpEngine.runStreamingProcess(
+                    executable: ffmpeg,
+                    arguments: arguments,
+                    currentDirectory: tempDir,
+                    // ffmpeg 的 -progress 每约 0.5s 必有输出；2 分钟静默 = 真挂死。
+                    stallTimeout: 120,
+                    isSuspended: { control?.isPaused ?? false },
+                    onStart: { pid in
+                        if control?.isCancelled == true {
+                            // 启动瞬间已取消：立即终止进程树。
+                            TaskControlToken.signalTree(pid, SIGKILL)
+                        } else {
+                            control?.setActivePID(pid)
+                        }
+                    }
+                ) { line in
+                    if let fraction = Self.parseProgress(line: line, totalSeconds: totalSeconds) {
+                        progress(fraction)
                     }
                 }
-            ) { line in
-                if let fraction = Self.parseProgress(line: line, totalSeconds: totalSeconds) {
-                    progress(fraction)
-                }
+            } catch is ProcessStalledError {
+                throw VDLError.burnFailed("烧录进程超过 2 分钟没有任何输出，疑似挂死，已自动中止（可重试）。")
             }
         }
 
@@ -152,13 +188,14 @@ public struct FFmpegBurner: SubtitleBurner {
         var (status, stderrTail) = try await run(head + videoCodecArgs + tail(audio: copyAudio))
         control?.setActivePID(0)
 
-        // 5. 原音轨无法直接 copy 进 mp4 容器 → 转码 aac 重试一次。
-        if status != 0 {
+        // 5. 首跑失败 → 用 aac 音轨重试一次（音轨 copy 不进 mp4 容器是最常见原因，
+        //    字符串匹配 ffmpeg 文案会随版本漂移，干脆除不可修复错误外都重试，代价小）。
+        if status != 0, control?.isCancelled != true {
             let lower = stderrTail.lowercased()
-            let audioCopyFailed = lower.contains("could not find tag")
-                || lower.contains("incompatible")
-                || lower.contains("codec not currently supported in container")
-            if audioCopyFailed {
+            let unfixable = lower.contains("error parsing filterchain")
+                || lower.contains("no such filter")
+                || lower.contains("no such file")
+            if !unfixable {
                 try? fm.removeItem(at: tempDir.appendingPathComponent("out.mp4"))
                 (status, stderrTail) = try await run(head + videoCodecArgs + tail(audio: aacAudio))
                 control?.setActivePID(0)
@@ -362,7 +399,7 @@ public struct FFmpegBurner: SubtitleBurner {
 
         [V4+ Styles]
         Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-        Style: ZH,PingFang SC,\(chineseFontSize),&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,1,0,2,12,12,20,1
+        Style: ZH,\(chineseFontName),\(chineseFontSize),&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,1,0,2,12,12,20,1
 
         [Events]
         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

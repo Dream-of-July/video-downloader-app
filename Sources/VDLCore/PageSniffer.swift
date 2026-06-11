@@ -6,13 +6,17 @@ public struct PageSniffer {
 
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
 
-    private let session: URLSession
-
-    public init() {
+    /// 共享会话：URLSession 在显式 invalidate 前由系统强持有，
+    /// 每次嗅探新建会随批量解析成批泄漏，故全局复用一个。
+    private static let sharedSession: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
-        session = URLSession(configuration: config)
-    }
+        return URLSession(configuration: config)
+    }()
+
+    private var session: URLSession { Self.sharedSession }
+
+    public init() {}
 
     // MARK: - 入口
 
@@ -20,6 +24,8 @@ public struct PageSniffer {
         let html: String
         do {
             html = try await fetchHTML(from: pageURL)
+        } catch let error as VDLError {
+            throw error
         } catch {
             throw VDLError.sniffFailed("页面加载失败，请检查网络后重试。")
         }
@@ -33,6 +39,15 @@ public struct PageSniffer {
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw URLError(.badServerResponse)
+        }
+        // 大文件防护：用户可能把可直接 GET 的大媒体文件链接粘进来（yt-dlp 拿不下时
+        // 会走到嗅探兜底）。非文本类型或超过 8MB 的响应不当 HTML 解析。
+        if let mime = response.mimeType?.lowercased(),
+           !(mime.contains("html") || mime.contains("text") || mime.contains("xml")) {
+            throw VDLError.sniffFailed("这个链接指向的是媒体文件而非网页（\(mime)），无法嗅探。")
+        }
+        guard data.count <= 8 * 1024 * 1024 else {
+            throw VDLError.sniffFailed("页面过大（\(data.count / 1024 / 1024)MB），已停止嗅探。")
         }
         return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
     }

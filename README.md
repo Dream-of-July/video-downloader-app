@@ -48,6 +48,16 @@ swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli ping-llm --provider 
 swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli ping-llm --provider openai --base https://api.openai.com --model gpt-5.4 --token "$OPENAI_API_KEY"
 ```
 
+## 性能与队列
+
+- 队列并发有上限（设置 → 性能）：同时下载数默认 3、同时压制数默认 2，超出的任务显示「排队中」自动等待；**暂停一个任务会把空位让给下一个**，恢复时重新排队领取。
+- 字幕翻译分块并行（单任务内 3 路并发请求）。
+- 防卡死：yt-dlp 带 `--socket-timeout/--retries` 与分片并发（`-N 4`）；下载/烧录/HLS 字幕均有「无输出停滞看门狗」（10 分钟 / 2 分钟 / 1 分钟），挂死自动中止并可重试续传。
+
+## Windows
+
+核心层与 `vdl-cli` 已做条件编译适配（GUI 仅 macOS），构建步骤与平台差异见 [docs/WINDOWS.md](docs/WINDOWS.md)。**尚未在真实 Windows 上验证。**
+
 ## 目录结构
 
 - `Sources/VDLCore/` — 核心：契约类型（`Models.swift`）、yt-dlp 封装（`Engine.swift`）、页面嗅探（`PageSniffer.swift`）

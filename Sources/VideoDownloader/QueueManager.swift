@@ -5,8 +5,66 @@ import Foundation
 import VDLCore
 #endif
 
+/// 阶段槽位池：限制同一阶段（下载 / 压制 / 翻译）的并发任务数。
+/// 全部在 MainActor 上运转，无锁；排队者被唤醒后重新竞争（队列规模小，开销可忽略）。
+@MainActor
+final class StageSlotPool {
+    private let capacity: () -> Int
+    private var inUse = 0
+    private var parked: [(id: UUID, continuation: CheckedContinuation<Void, Never>)] = []
+
+    init(capacity: @escaping () -> Int) {
+        self.capacity = capacity
+    }
+
+    var hasFreeSlot: Bool { inUse < max(1, capacity()) }
+
+    /// 等待并占用一个槽位。control 取消时抛 cancelled。
+    /// respectPause=true 时，暂停中的任务不抢槽（等恢复后再竞争）；
+    /// 恢复重排队的路径传 false（item 已恢复但 token 仍处暂停态，等槽到手才 SIGCONT）。
+    func acquire(id: UUID, control: TaskControlToken, respectPause: Bool = true) async throws {
+        while true {
+            if Task.isCancelled || control.isCancelled { throw VDLError.cancelled }
+            if respectPause, control.isPaused {
+                try await control.gate()
+                continue
+            }
+            if hasFreeSlot {
+                inUse += 1
+                return
+            }
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                parked.append((id, c))
+            }
+        }
+    }
+
+    /// 释放一个槽位并唤醒全部排队者重新竞争。
+    func release() {
+        inUse = max(0, inUse - 1)
+        wakeAll()
+    }
+
+    /// 容量调大（设置变更）后让排队者重新竞争。
+    func wakeAll() {
+        let waiting = parked
+        parked.removeAll()
+        for waiter in waiting { waiter.continuation.resume() }
+    }
+
+    /// 取消某项时把它从排队里唤出（acquire 循环会自行检查取消并抛出）。
+    func wake(id: UUID) {
+        guard let index = parked.firstIndex(where: { $0.id == id }) else { return }
+        let continuation = parked[index].continuation
+        parked.remove(at: index)
+        continuation.resume()
+    }
+}
+
 /// 下载队列。每个 QueueItem 是一条「下载 →[翻译]→[烧录]」完整流水线，
-/// 持有独立的 TaskControlToken，可随时独立暂停 / 恢复 / 取消，并发执行互不阻塞。
+/// 持有独立的 TaskControlToken，可随时独立暂停 / 恢复 / 取消，并发执行互不阻塞；
+/// 三个阶段各有并发上限（下载/压制可在设置里调，翻译固定 2 防网关限流），
+/// 暂停会让出占用的下载/压制槽位给其它任务，恢复时重新排队领取。
 @MainActor
 final class QueueManager: ObservableObject {
 
@@ -41,6 +99,8 @@ final class QueueManager: ObservableObject {
         /// 下载已 100%、正在合并/转码/字幕转换（progress 为 nil 但仍处于 .downloading）。
         /// UI 据此显示「处理中…」而非「下载中…」（避免像卡死）。
         var isPostDownloadProcessing: Bool = false
+        /// 部分成功：视频已下载但字幕处理失败（done 态显示「重试字幕处理」按钮）。
+        var partialFailure: Bool = false
         /// 本项流水线的控制令牌；retry 时换新的（旧的已 cancel）。
         var control: TaskControlToken
         /// 流水线代际：每次 enqueue/retry 递增；@MainActor 写回前校验，作废陈旧回调。
@@ -50,7 +110,25 @@ final class QueueManager: ObservableObject {
 
     @Published var items: [QueueItem] = []
 
+    /// 同时下载数（设置变更时由 ViewModel 同步；调大即时生效）。
+    var maxConcurrentDownloads: Int {
+        didSet { downloadPool.wakeAll() }
+    }
+    /// 同时压制数。
+    var maxConcurrentBurns: Int {
+        didSet { burnPool.wakeAll() }
+    }
+
     private let engine: any DownloadEngine
+    private lazy var downloadPool = StageSlotPool { [weak self] in self?.maxConcurrentDownloads ?? 3 }
+    private lazy var burnPool = StageSlotPool { [weak self] in self?.maxConcurrentBurns ?? 2 }
+    /// 翻译并发固定 2（每项内部还有 3 路分块并行，再高容易撞网关限流）。
+    private lazy var translatePool = StageSlotPool { 2 }
+    /// 正在占用槽位的项（暂停让位 / 阶段结束释放用）。带代际：重试后旧流水线的
+    /// 延迟释放不得动新代际刚领到的槽位。
+    private var holdingPool: [UUID: (generation: Int, pool: StageSlotPool)] = [:]
+    /// 暂停时让出的槽位池：恢复时需先重新领到槽位再 SIGCONT。
+    private var resumePool: [UUID: (generation: Int, pool: StageSlotPool)] = [:]
 
     /// 视频文件后缀（用于在产物里识别可烧录的视频）
     private static let videoExtensions: Set<String> = [
@@ -59,34 +137,55 @@ final class QueueManager: ObservableObject {
 
     init(engine: any DownloadEngine = makeDefaultEngine()) {
         self.engine = engine
+        let settings = AppSettings.load()
+        self.maxConcurrentDownloads = settings.maxConcurrentDownloads
+        self.maxConcurrentBurns = settings.maxConcurrentBurns
     }
 
-    // MARK: - 派生状态
-
-    /// 有进行中（非暂停 / 完成 / 失败 / 取消）的任务，关窗确认据此判断。
-    var hasActiveTasks: Bool {
-        items.contains { item in
-            guard !item.isPaused else { return false }
-            switch item.stage {
-            case .queued, .downloading, .translating, .burning:
-                return true
-            case .done, .failed, .cancelled:
-                return false
-            }
+    /// 设置保存后同步并发上限（didSet 会唤醒排队者）。
+    func syncConcurrency(from settings: AppSettings) {
+        if maxConcurrentDownloads != settings.maxConcurrentDownloads {
+            maxConcurrentDownloads = settings.maxConcurrentDownloads
+        }
+        if maxConcurrentBurns != settings.maxConcurrentBurns {
+            maxConcurrentBurns = settings.maxConcurrentBurns
         }
     }
 
-    var activeTaskCount: Int {
-        items.filter { item in
-            guard !item.isPaused else { return false }
-            switch item.stage {
-            case .queued, .downloading, .translating, .burning:
-                return true
-            case .done, .failed, .cancelled:
-                return false
-            }
-        }.count
+    // MARK: - 槽位辅助
+
+    /// 等槽位（满员时先把状态文案改成等待提示），拿到后按代际登记为持有。
+    private func acquireSlot(
+        _ pool: StageSlotPool, id: UUID, generation: Int,
+        control: TaskControlToken, waitingText: String
+    ) async throws {
+        if !pool.hasFreeSlot {
+            update(id, generation: generation) { $0.statusText = waitingText }
+        }
+        try await pool.acquire(id: id, control: control)
+        // 等待期间可能已被 retry 换代：旧代际拿到的槽立即归还，避免错记到新代际名下。
+        guard item(id)?.generation == generation else {
+            pool.release()
+            throw VDLError.cancelled
+        }
+        holdingPool[id] = (generation, pool)
+        update(id, generation: generation) { if $0.statusText == waitingText { $0.statusText = nil } }
     }
+
+    /// 阶段结束（成功或失败）释放槽位；只释放本代际登记的，暂停已让位时自然空操作。
+    private func releaseSlot(_ id: UUID, generation: Int) {
+        guard let holding = holdingPool[id], holding.generation == generation else { return }
+        holdingPool.removeValue(forKey: id)
+        holding.pool.release()
+    }
+
+    private func wakeFromAllPools(_ id: UUID) {
+        downloadPool.wake(id: id)
+        burnPool.wake(id: id)
+        translatePool.wake(id: id)
+    }
+
+    // MARK: - 派生状态
 
     /// 未到终态的任务数（queued/downloading/translating/burning，含已暂停）。
     /// 关窗确认据此统计，避免「只剩暂停任务」时静默丢弃。
@@ -177,27 +276,29 @@ final class QueueManager: ObservableObject {
         if skipDownload {
             downloadFiles = current.resultFiles
         } else {
-            update(id) { $0.stage = .downloading; $0.progress = nil; $0.statusText = nil; $0.isPostDownloadProcessing = false }
             do {
+                try await acquireSlot(downloadPool, id: id, generation: generation, control: control, waitingText: "排队中：等待下载空位")
+                defer { releaseSlot(id, generation: generation) }
+                update(id, generation: generation) { $0.stage = .downloading; $0.progress = nil; $0.statusText = nil; $0.isPostDownloadProcessing = false }
                 let result = try await engine.download(current.request, control: control) { [weak self] p in
                     Task { @MainActor in
-                        self?.applyDownloadProgress(id: id, p)
+                        self?.applyDownloadProgress(id: id, generation: generation, p)
                     }
                 }
-                guard item(id) != nil else { return }
+                guard item(id)?.generation == generation else { return }
                 downloadFiles = result.files
-                update(id) { $0.resultFiles = result.files; $0.progress = nil }
+                update(id, generation: generation) { $0.resultFiles = result.files; $0.progress = nil }
             } catch {
-                guard item(id) != nil else { return }
+                guard item(id)?.generation == generation else { return }
                 if isCancellation(error) {
-                    update(id) {
+                    update(id, generation: generation) {
                         $0.stage = .cancelled
                         $0.isPaused = false
                         $0.progress = nil
                         $0.statusText = "已取消"
                     }
                 } else {
-                    update(id) {
+                    update(id, generation: generation) {
                         $0.stage = .failed(Self.shortReason(of: error))
                         $0.isPaused = false
                         $0.progress = nil
@@ -210,14 +311,14 @@ final class QueueManager: ObservableObject {
 
         // 下载完成，无需中文字幕：直接完成
         guard mode != .off else {
-            finishDone(id, files: downloadFiles, statusText: nil)
+            finishDone(id, generation: generation, files: downloadFiles, statusText: nil)
             return
         }
 
         // 找翻译源字幕；没有就完成并提示已跳过
         let preferredLang = current.request.subtitleLangs.first ?? current.request.autoSubtitleLangs.first
         guard let srtFile = Self.pickSourceSubtitle(from: downloadFiles, preferredLang: preferredLang) else {
-            finishDone(id, files: downloadFiles, statusText: "没有字幕文件，已跳过翻译")
+            finishDone(id, generation: generation, files: downloadFiles, statusText: "没有字幕文件，已跳过翻译")
             return
         }
 
@@ -228,18 +329,20 @@ final class QueueManager: ObservableObject {
         if sourceIsChinese {
             // srtOnly：原中文 srt 即结果（已在 downloadFiles 里），不再生成 .zh.srt。
             guard mode == .burnIn else {
-                finishDone(id, files: downloadFiles, statusText: "使用视频自带中文字幕，已跳过翻译")
+                finishDone(id, generation: generation, files: downloadFiles, statusText: "使用视频自带中文字幕，已跳过翻译")
                 return
             }
             // burnIn：直接拿原中文 srt 去烧录。
             guard let video = downloadFiles.first(where: {
                 Self.videoExtensions.contains($0.pathExtension.lowercased())
             }) else {
-                finishDone(id, files: downloadFiles, statusText: "没有找到视频文件，已跳过烧录")
+                finishDone(id, generation: generation, files: downloadFiles, statusText: "没有找到视频文件，已跳过烧录")
                 return
             }
-            update(id) { $0.stage = .burning; $0.progress = nil; $0.statusText = "使用视频自带中文字幕，直接烧录（不翻译）" }
             do {
+                try await acquireSlot(burnPool, id: id, generation: generation, control: control, waitingText: "排队中：等待压制空位")
+                defer { releaseSlot(id, generation: generation) }
+                update(id, generation: generation) { $0.stage = .burning; $0.progress = nil; $0.statusText = "使用视频自带中文字幕，直接烧录（不翻译）" }
                 let burner = makeBurner()
                 let burned = try await burner.burn(
                     video: video,
@@ -254,23 +357,25 @@ final class QueueManager: ObservableObject {
                         }
                     }
                 }
-                guard item(id) != nil else { return }
-                update(id) {
+                guard item(id)?.generation == generation else { return }
+                update(id, generation: generation) {
                     $0.resultFiles.removeAll { $0 == burned }
                     $0.resultFiles.insert(burned, at: 0)
                 }
-                finishDone(id, files: item(id)?.resultFiles ?? downloadFiles, statusText: "已烧录视频自带中文字幕")
+                finishDone(id, generation: generation, files: item(id)?.resultFiles ?? downloadFiles, statusText: "已烧录视频自带中文字幕")
             } catch {
-                guard item(id) != nil else { return }
-                settlePartial(id, files: item(id)?.resultFiles ?? downloadFiles, error: error, phase: "烧录")
+                guard item(id)?.generation == generation else { return }
+                settlePartial(id, generation: generation, files: item(id)?.resultFiles ?? downloadFiles, error: error, phase: "烧录")
             }
             return
         }
 
         // 2. 翻译
-        update(id) { $0.stage = .translating; $0.progress = nil; $0.statusText = nil }
         let zhSrt: URL
         do {
+            try await acquireSlot(translatePool, id: id, generation: generation, control: control, waitingText: "排队中：等待翻译空位")
+            defer { releaseSlot(id, generation: generation) }
+            update(id, generation: generation) { $0.stage = .translating; $0.progress = nil; $0.statusText = nil }
             let translator = makeTranslator(settings: settings)
             zhSrt = try await translator.translate(
                 srtFile: srtFile,
@@ -284,31 +389,33 @@ final class QueueManager: ObservableObject {
                     }
                 }
             }
-            guard item(id) != nil else { return }
-            update(id) {
+            guard item(id)?.generation == generation else { return }
+            update(id, generation: generation) {
                 $0.progress = nil
                 if !$0.resultFiles.contains(zhSrt) { $0.resultFiles.append(zhSrt) }
             }
         } catch {
-            guard item(id) != nil else { return }
-            settlePartial(id, files: downloadFiles, error: error, phase: "翻译")
+            guard item(id)?.generation == generation else { return }
+            settlePartial(id, generation: generation, files: downloadFiles, error: error, phase: "翻译")
             return
         }
 
         // 3. 烧录（仅 burnIn）
         guard mode == .burnIn else {
-            finishDone(id, files: item(id)?.resultFiles ?? downloadFiles, statusText: nil)
+            finishDone(id, generation: generation, files: item(id)?.resultFiles ?? downloadFiles, statusText: nil)
             return
         }
         guard let video = downloadFiles.first(where: {
             Self.videoExtensions.contains($0.pathExtension.lowercased())
         }) else {
-            finishDone(id, files: item(id)?.resultFiles ?? downloadFiles, statusText: "没有找到视频文件，已跳过烧录")
+            finishDone(id, generation: generation, files: item(id)?.resultFiles ?? downloadFiles, statusText: "没有找到视频文件，已跳过烧录")
             return
         }
 
-        update(id) { $0.stage = .burning; $0.progress = nil; $0.statusText = nil }
         do {
+            try await acquireSlot(burnPool, id: id, generation: generation, control: control, waitingText: "排队中：等待压制空位")
+            defer { releaseSlot(id, generation: generation) }
+            update(id, generation: generation) { $0.stage = .burning; $0.progress = nil; $0.statusText = nil }
             let burner = makeBurner()
             let burned = try await burner.burn(
                 video: video,
@@ -323,27 +430,31 @@ final class QueueManager: ObservableObject {
                     }
                 }
             }
-            guard item(id) != nil else { return }
-            update(id) {
+            guard item(id)?.generation == generation else { return }
+            update(id, generation: generation) {
                 $0.resultFiles.removeAll { $0 == burned }
                 $0.resultFiles.insert(burned, at: 0)
             }
-            finishDone(id, files: item(id)?.resultFiles ?? downloadFiles, statusText: nil)
+            finishDone(id, generation: generation, files: item(id)?.resultFiles ?? downloadFiles, statusText: nil)
         } catch {
-            guard item(id) != nil else { return }
-            settlePartial(id, files: item(id)?.resultFiles ?? downloadFiles, error: error, phase: "烧录")
+            guard item(id)?.generation == generation else { return }
+            settlePartial(id, generation: generation, files: item(id)?.resultFiles ?? downloadFiles, error: error, phase: "烧录")
         }
     }
 
-    /// 下载进度单调上报：转 0...1（processing 阶段进度不确定，置 nil）。
-    private func applyDownloadProgress(id: UUID, _ p: DownloadProgress) {
-        guard item(id) != nil else { return }
-        update(id) {
+    /// 下载进度上报：转 0...1（processing 阶段进度不确定，置 nil）。
+    /// 节流：进度变化 < 1% 时不写 items，避免高频 objectWillChange 在长队列时拖累 UI。
+    private func applyDownloadProgress(id: UUID, generation: Int, _ p: DownloadProgress) {
+        update(id, generation: generation) {
             // 进入烧录/翻译后不再被迟到的下载回调覆盖
             guard $0.stage == .downloading else { return }
             switch p.phase {
             case .downloading:
-                $0.progress = p.percent.map { min(max($0 / 100, 0), 1) }
+                let newValue = p.percent.map { min(max($0 / 100, 0), 1) }
+                if let new = newValue, let old = $0.progress, new < 1, abs(new - old) < 0.01 {
+                    return
+                }
+                $0.progress = newValue
                 $0.isPostDownloadProcessing = false
             case .preparing, .finished:
                 $0.progress = nil
@@ -356,11 +467,11 @@ final class QueueManager: ObservableObject {
         }
     }
 
-    /// 部分成功：下载产物已落盘 → .done + 失败说明；否则视为 .failed。
+    /// 部分成功：下载产物已落盘 → .done + 失败说明（可重试字幕处理）；否则视为 .failed。
     /// 取消（VDLError.cancelled / Task 取消）→ .cancelled，保留已下产物。
-    private func settlePartial(_ id: UUID, files: [URL], error: Error, phase: String) {
+    private func settlePartial(_ id: UUID, generation: Int, files: [URL], error: Error, phase: String) {
         if isCancellation(error) {
-            update(id) {
+            update(id, generation: generation) {
                 $0.stage = .cancelled
                 $0.isPaused = false
                 $0.progress = nil
@@ -370,14 +481,15 @@ final class QueueManager: ObservableObject {
         }
         let reason = Self.shortReason(of: error)
         if !files.isEmpty {
-            update(id) {
+            update(id, generation: generation) {
                 $0.stage = .done
                 $0.isPaused = false
                 $0.progress = nil
+                $0.partialFailure = true
                 $0.statusText = "视频已下载，字幕\(phase)失败：\(reason)"
             }
         } else {
-            update(id) {
+            update(id, generation: generation) {
                 $0.stage = .failed(reason)
                 $0.isPaused = false
                 $0.progress = nil
@@ -386,11 +498,12 @@ final class QueueManager: ObservableObject {
         }
     }
 
-    private func finishDone(_ id: UUID, files: [URL], statusText: String?) {
-        update(id) {
+    private func finishDone(_ id: UUID, generation: Int, files: [URL], statusText: String?) {
+        update(id, generation: generation) {
             $0.stage = .done
             $0.isPaused = false
             $0.progress = nil
+            $0.partialFailure = false
             $0.resultFiles = files.isEmpty ? $0.resultFiles : files
             $0.statusText = statusText
         }
@@ -399,36 +512,75 @@ final class QueueManager: ObservableObject {
     // MARK: - 单项控制
 
     func pause(_ id: UUID) {
-        guard let target = item(id) else { return }
+        guard let target = item(id), Self.isOpen(target.stage), !target.isPaused else { return }
         target.control.pause()
+        // 让出占用的下载/压制槽位给其它任务；恢复时重新排队领取。
+        if let holding = holdingPool[id], holding.generation == target.generation {
+            holdingPool.removeValue(forKey: id)
+            holding.pool.release()
+            resumePool[id] = holding
+        }
         update(id) { $0.isPaused = true }
     }
 
     func resume(_ id: UUID) {
-        guard let target = item(id) else { return }
-        target.control.resume()
+        guard let target = item(id), target.isPaused else { return }
         update(id) { $0.isPaused = false }
+        guard let parked = resumePool.removeValue(forKey: id),
+              parked.generation == target.generation else {
+            // 没让过位（翻译阶段 / 排队中暂停）：直接恢复，acquire 循环或 gate 会接着走。
+            target.control.resume()
+            return
+        }
+        // 让过位的：先重新领到槽位再 SIGCONT，避免恢复瞬间超出并发上限。
+        let control = target.control
+        let generation = target.generation
+        update(id, generation: generation) { $0.statusText = "等待空位恢复…" }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await parked.pool.acquire(id: id, control: control, respectPause: false)
+                guard self.item(id)?.generation == generation else {
+                    parked.pool.release()
+                    return
+                }
+                self.holdingPool[id] = (generation, parked.pool)
+                self.update(id, generation: generation) {
+                    if $0.statusText == "等待空位恢复…" { $0.statusText = nil }
+                }
+                control.resume()
+            } catch {
+                // 等槽期间被取消：流水线任务自会收敛，这里不动状态。
+            }
+        }
     }
 
     func cancel(_ id: UUID) {
         guard let target = item(id) else { return }
+        resumePool.removeValue(forKey: id)
         target.control.cancel()
         target.task?.cancel()
+        // 还在排队等槽位的，唤出来让 acquire 循环抛出取消。
+        wakeFromAllPools(id)
     }
 
     func remove(_ id: UUID) {
         guard let target = item(id) else { return }
+        resumePool.removeValue(forKey: id)
         target.control.cancel()
         target.task?.cancel()
+        wakeFromAllPools(id)
         items.removeAll { $0.id == id }
     }
 
     /// 重试：保留已下载产物则跳过下载，仅重跑字幕处理；无产物则整条重跑。
     func retry(_ id: UUID) {
         guard let old = item(id) else { return }
-        // 旧 control 若仍登记着进程，确保释放
+        // 旧 control 若仍登记着进程，确保释放；清掉旧代际的槽位记账。
+        resumePool.removeValue(forKey: id)
         old.control.cancel()
         old.task?.cancel()
+        wakeFromAllPools(id)
 
         let hasVideo = old.resultFiles.contains {
             Self.videoExtensions.contains($0.pathExtension.lowercased())
@@ -442,6 +594,7 @@ final class QueueManager: ObservableObject {
             $0.isPaused = false
             $0.progress = nil
             $0.isPostDownloadProcessing = false
+            $0.partialFailure = false
             $0.statusText = skipDownload ? nil : "重新下载并处理"
             if !skipDownload { $0.resultFiles = [] }
         }

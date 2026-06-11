@@ -34,7 +34,8 @@ func splitLangs(_ value: String) -> [String] {
 
 /// 凭证脱敏：只显示前 6 位，绝不回显完整值。
 func maskToken(_ token: String) -> String {
-    String(token.prefix(6)) + "…"
+    guard token.count > 8 else { return "…" }  // 短 token 全打码，避免变相回显
+    return String(token.prefix(6)) + "…"
 }
 
 /// 解析 translate / ping-llm 共用的 LLM 相关 flags，覆盖到 settings；返回 token 是否被命令行覆盖。

@@ -64,7 +64,15 @@ private final class ProcessBox: @unchecked Sendable {
         cancelled = true
         let p = process
         lock.unlock()
-        if let p, p.isRunning { p.terminate() }
+        guard let p, p.isRunning else { return }
+        p.terminate()
+        // SIGTERM 不进树也可能被无视：3 秒后整棵进程树 SIGKILL 兜底，
+        // 防止孙进程占着管道写端让 EOF 永不到来。
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+            if p.isRunning {
+                TaskControlToken.signalTree(p.processIdentifier, SIGKILL)
+            }
+        }
     }
 
     var isCancelled: Bool {
@@ -87,6 +95,9 @@ private final class ProcessBox: @unchecked Sendable {
 }
 
 /// 流式下载进程的共享状态：stdout 行缓冲（半行拼接）、stderr 尾部、单次 resume 保护。
+/// 进程停滞（看门狗超时无任何输出被强杀）。调用方据此映射为各自的友好错误。
+struct ProcessStalledError: Error {}
+
 private final class StreamingState: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
@@ -95,12 +106,58 @@ private final class StreamingState: @unchecked Sendable {
     private var lineBuffer = Data()
     private var stderrData = Data()
     private let stderrLimit = 16 * 1024
+    private var lastActivity = Date()
+    private var stalledFlag = false
+    private var stallTimer: DispatchSourceTimer?
 
     func register(_ p: Process) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         process = p
+        lastActivity = Date()
         return cancelled
+    }
+
+    /// 刷新活动时间（有任何输出 / 暂停期间由看门狗代为刷新）。
+    func touch() {
+        lock.lock()
+        lastActivity = Date()
+        lock.unlock()
+    }
+
+    var isStalled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stalledFlag
+    }
+
+    /// 看门狗：静默超过 timeout 则标记停滞并强杀进程树（含子进程）。
+    func killIfSilent(longerThan timeout: TimeInterval) {
+        lock.lock()
+        let silent = Date().timeIntervalSince(lastActivity) > timeout
+        if silent { stalledFlag = true }
+        let p = process
+        lock.unlock()
+        guard silent, let p, p.isRunning else { return }
+        let pid = p.processIdentifier
+        for child in Self.childProcessIDs(of: pid) {
+            kill(child, SIGKILL)
+        }
+        if p.isRunning { kill(pid, SIGKILL) }
+    }
+
+    func setStallTimer(_ timer: DispatchSourceTimer) {
+        lock.lock()
+        stallTimer = timer
+        lock.unlock()
+    }
+
+    func cancelStallTimer() {
+        lock.lock()
+        let timer = stallTimer
+        stallTimer = nil
+        lock.unlock()
+        timer?.cancel()
     }
 
     func cancel() {
@@ -150,6 +207,7 @@ private final class StreamingState: @unchecked Sendable {
         if stderrData.count > stderrLimit {
             stderrData.removeFirst(stderrData.count - stderrLimit)
         }
+        lastActivity = Date()
         lock.unlock()
     }
 
@@ -163,6 +221,7 @@ private final class StreamingState: @unchecked Sendable {
     func consumeLines(appending data: Data) -> [String] {
         lock.lock()
         defer { lock.unlock() }
+        lastActivity = Date()
         lineBuffer.append(data)
         var lines: [String] = []
         while let index = lineBuffer.firstIndex(of: 0x0A) {
@@ -207,14 +266,33 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     private let cacheLock = NSLock()
     private var infoCache: [String: [String: Any]] = [:]
+    private var infoCacheOrder: [String] = []
     /// analyze 阶段从 HLS master m3u8 解析出的字幕表：sourceURL -> [langCode: 字幕 m3u8 绝对 URL]。
     /// download 阶段据此用 ffmpeg 取这些 yt-dlp 拿不到的 HLS 内嵌字幕。
     private var hlsSubtitleCache: [String: [String: String]] = [:]
+    private var hlsCacheOrder: [String] = []
 
     public init() {}
 
     // MARK: 二进制定位
 
+    #if os(Windows)
+    /// Windows：沿 PATH（; 分隔，键大小写不敏感）找 <name>.exe。
+    private static func locateBinary(named name: String, envVar: String) -> String? {
+        let fm = FileManager.default
+        let env = ProcessInfo.processInfo.environment
+        if let custom = env[envVar], !custom.isEmpty, fm.isExecutableFile(atPath: custom) {
+            return custom
+        }
+        let exe = name.lowercased().hasSuffix(".exe") ? name : name + ".exe"
+        let pathValue = env.first { $0.key.lowercased() == "path" }?.value ?? ""
+        for dir in pathValue.split(separator: ";") {
+            let candidate = String(dir) + "\\" + exe
+            if fm.isExecutableFile(atPath: candidate) { return candidate }
+        }
+        return nil
+    }
+    #else
     private static let searchDirectories = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
 
     private static func locateBinary(named name: String, envVar: String) -> String? {
@@ -229,6 +307,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         }
         return nil
     }
+    #endif
 
     private func ytDlpPath() throws -> String {
         guard let path = Self.locateBinary(named: "yt-dlp", envVar: "VDL_YTDLP_PATH") else {
@@ -264,6 +343,10 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     /// YouTube 的 n-challenge 必须能找到 Homebrew 里的 deno/node（JS 运行时），
     /// 否则所有视频格式都会被跳过（"Requested format is not available"）。
     static func subprocessEnvironment() -> [String: String] {
+        #if os(Windows)
+        // Windows：PATH 原样透传（deno/node/yt-dlp/ffmpeg 需用户装在 PATH 里）。
+        return ProcessInfo.processInfo.environment
+        #else
         var env = ProcessInfo.processInfo.environment
         var parts = (env["PATH"] ?? "/usr/bin:/bin").components(separatedBy: ":")
         for dir in ["/usr/local/bin", "/opt/homebrew/bin"] where !parts.contains(dir) {
@@ -271,15 +354,29 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         }
         env["PATH"] = parts.joined(separator: ":")
         return env
+        #endif
     }
 
     // MARK: 站点登录 cookies
 
     /// 站点登录导出的 cookies 文件存在时，所有 yt-dlp 调用都带上 --cookies。
-    private static func cookieArguments() -> [String] {
-        let cookieFile = AppSettings.cookieFileURL
-        guard FileManager.default.fileExists(atPath: cookieFile.path) else { return [] }
-        return ["--cookies", cookieFile.path]
+    /// yt-dlp 的 --cookies 是「读取并在退出时**写回**」语义：并发任务共用主 cookies.txt
+    /// 会互相覆写甚至损坏，写回还会把 0600 权限放宽。因此每次启动子进程都发一份
+    /// 任务私有临时副本（写回只落在副本上），用后由 cleanup 删除。
+    private static func makeCookieArguments() -> (args: [String], cleanup: @Sendable () -> Void) {
+        let master = AppSettings.cookieFileURL
+        guard FileManager.default.fileExists(atPath: master.path) else { return ([], {}) }
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vdl-cookies-\(UUID().uuidString).txt")
+        do {
+            try FileManager.default.copyItem(at: master, to: temp)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: temp.path
+            )
+        } catch {
+            return ([], {})  // 副本失败就不带 cookies，不阻塞下载
+        }
+        return (["--cookies", temp.path], { try? FileManager.default.removeItem(at: temp) })
     }
 
     /// 识别"需要登录"类错误。命中返回 loginRequired（或已登录时的过期文案），否则返回 nil 走常规文案。
@@ -312,6 +409,10 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     // MARK: 信息缓存
 
+    /// 缓存条数上限：单条 YouTube -J JSON 可达 1-2MB，引擎与 App 同寿命，
+    /// 不设上限的话长会话内存只增不减。FIFO 淘汰最旧的。
+    private static let cacheLimit = 32
+
     private func cachedInfo(for url: String) -> [String: Any]? {
         cacheLock.lock()
         defer { cacheLock.unlock() }
@@ -320,6 +421,13 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     private func setCachedInfo(_ info: [String: Any], for url: String) {
         cacheLock.lock()
+        if infoCache[url] == nil {
+            infoCacheOrder.append(url)
+            if infoCacheOrder.count > Self.cacheLimit {
+                let evicted = infoCacheOrder.removeFirst()
+                infoCache.removeValue(forKey: evicted)
+            }
+        }
         infoCache[url] = info
         cacheLock.unlock()
     }
@@ -332,6 +440,13 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     private func setCachedHLSSubtitles(_ table: [String: String], for url: String) {
         cacheLock.lock()
+        if hlsSubtitleCache[url] == nil {
+            hlsCacheOrder.append(url)
+            if hlsCacheOrder.count > Self.cacheLimit {
+                let evicted = hlsCacheOrder.removeFirst()
+                hlsSubtitleCache.removeValue(forKey: evicted)
+            }
+        }
         hlsSubtitleCache[url] = table
         cacheLock.unlock()
     }
@@ -406,12 +521,14 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     private func runYtDlpJSON(for url: String) async throws -> YtDlpJSONResult {
         let ytdlp = try ytDlpPath()
         let ffmpegDir = try ffmpegDirectory()
+        let cookie = Self.makeCookieArguments()
+        defer { cookie.cleanup() }
         var lastStderr = ""
         for attempt in 0..<2 {
             let output = try await Self.runProcess(
                 executable: ytdlp,
                 arguments: ["-J", "--no-playlist", "--ffmpeg-location", ffmpegDir]
-                    + Self.cookieArguments() + [url],
+                    + cookie.args + [url],
                 timeout: 60
             )
             if output.timedOut {
@@ -730,8 +847,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     private static func outputTemplate(preferredTitle: String?) -> String {
         guard let raw = preferredTitle else { return "%(title).180B [%(id)s].%(ext)s" }
         var clean = raw.replacingOccurrences(of: "%", with: "%%")
+        // 换行/控制字符并入分隔集：含 \n 的页面标题会破坏 --print 行匹配
         clean = clean
-            .components(separatedBy: CharacterSet(charactersIn: "/\\:\0"))
+            .components(separatedBy: CharacterSet(charactersIn: "/\\:\0").union(.newlines))
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if clean.count > 120 { clean = String(clean.prefix(120)) }
@@ -756,8 +874,15 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             "--ffmpeg-location", ffmpegDir,
             "-P", destDir.path,
             "-o", Self.outputTemplate(preferredTitle: request.preferredTitle),
+            // 网络韧性：分片并发提速 + 读超时 + 重试，缓解通用站点的下载中途停滞。
+            "-N", "4",
+            "--socket-timeout", "30",
+            "--retries", "10",
+            "--fragment-retries", "10",
         ]
-        args += Self.cookieArguments()
+        let cookie = Self.makeCookieArguments()
+        defer { cookie.cleanup() }
+        args += cookie.args
         if request.formatID == "audio" {
             args += ["-f", "ba/b", "-x", "--audio-format", "m4a"]
         } else {
@@ -787,6 +912,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             (status, stderrTail) = try await Self.runStreamingProcess(
                 executable: ytdlp,
                 arguments: args,
+                // 停滞看门狗：10 分钟完全无输出视为挂死（暂停中不计时）。
+                stallTimeout: 600,
+                isSuspended: { control?.isPaused ?? false },
                 onStart: { pid in
                     // 登记主下载进程 pid：暂停时 TaskControlToken 向其进程树
                     // （含派生的 ffmpeg）发 SIGSTOP/SIGCONT。
@@ -797,6 +925,12 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 if line.hasPrefix(destPrefix) { printedPaths.append(line) }
             }
             control?.setActivePID(0)
+        } catch is ProcessStalledError {
+            control?.setActivePID(0)
+            // 保留 .part 文件：yt-dlp 重试时可断点续传。
+            throw VDLError.downloadFailed(
+                "下载停滞：超过 10 分钟没有任何进度输出，已自动中止。可能是站点限速或网络中断，可点「重试」续传。"
+            )
         } catch {
             control?.setActivePID(0)
             // 取消路径：进程已确认退出，先清掉残留的临时文件再上抛。
@@ -812,7 +946,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             }
             throw VDLError.downloadFailed(Self.friendlyDownloadReason(stderrTail: stderrTail))
         }
-        progress(DownloadProgress(phase: .finished, percent: 100))
+        // 注意：HLS 字幕兜底还在后面，.finished 留到全部产物就绪后再报，
+        // 避免 UI 显示完成后任务还在后台拉字幕（源停摆时像卡死在 100%）。
+        progress(DownloadProgress(phase: .processing))
 
         // 优先用 --print after_move:filepath 的精确产出；目录扫描降级为兜底。
         let fm = FileManager.default
@@ -847,8 +983,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                     let table = await hlsSubtitleTable(for: request.url)
                     for lang in missing {
                         guard let m3u8 = table[lang] else { continue }
+                        if control?.isCancelled == true { throw VDLError.cancelled }
                         if let srt = await Self.fetchHLSSubtitle(
-                            m3u8: m3u8, lang: lang, videoFile: videoFile
+                            m3u8: m3u8, lang: lang, videoFile: videoFile, control: control
                         ), !files.contains(srt) {
                             files.append(srt)
                         }
@@ -856,6 +993,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 }
             }
         }
+        progress(DownloadProgress(phase: .finished, percent: 100))
         return DownloadResult(files: files)
     }
 
@@ -886,7 +1024,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     /// 用 ffmpeg 把单语 HLS 字幕 m3u8 转成 srt，输出 "<视频名去扩展>.<lang>.srt"。
     /// 失败返回 nil（记日志、跳过该 lang，不影响整体下载）。
-    private static func fetchHLSSubtitle(m3u8: String, lang: String, videoFile: URL) async -> URL? {
+    private static func fetchHLSSubtitle(
+        m3u8: String, lang: String, videoFile: URL, control: TaskControlToken?
+    ) async -> URL? {
         let ffmpeg = locateSubtitleFFmpeg()
         guard let ffmpeg else {
             FileHandle.standardError.write(Data("HLS 字幕转换跳过（找不到 ffmpeg）：\(lang)\n".utf8))
@@ -899,8 +1039,14 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         let result = try? await runStreamingProcess(
             executable: ffmpeg,
             arguments: ["-y", "-i", m3u8, output.path],
+            // 远端 m3u8 可能死链/停滞：1 分钟无输出即放弃该语言（try? 吞掉停滞错误）。
+            stallTimeout: 60,
+            isSuspended: { control?.isPaused ?? false },
+            // 登记 pid：暂停/取消也能管到这个收尾阶段的 ffmpeg。
+            onStart: { pid in control?.setActivePID(pid) },
             onLine: { _ in }
         )
+        control?.setActivePID(0)
         if let result, result.status == 0,
            FileManager.default.fileExists(atPath: output.path) {
             return output
@@ -1023,6 +1169,12 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                             if process.isRunning {
                                 box.markTimedOut()
                                 process.terminate()
+                                // SIGTERM 被无视时 3 秒后强杀整棵进程树兜底。
+                                DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                                    if process.isRunning {
+                                        TaskControlToken.signalTree(process.processIdentifier, SIGKILL)
+                                    }
+                                }
                             }
                         }
                         timeoutItem = item
@@ -1044,7 +1196,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                         group.leave()
                     }
                     process.waitUntilExit()
-                    group.wait()
+                    // 子进程若把 stdout/stderr fd 传给了仍存活的孙进程，EOF 永不到来：
+                    // 进程退出后最多再等 10 秒读尾巴，防止 group.wait 永久阻塞蚕食线程。
+                    _ = group.wait(timeout: .now() + 10)
                     timeoutItem?.cancel()
 
                     continuation.resume(returning: ProcessOutput(
@@ -1066,10 +1220,15 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     /// internal：Burner 复用它跑 ffmpeg/ffprobe。currentDirectory 为 nil 时不改工作目录。
     /// onStart 非空时在子进程成功启动后回调其 pid（用于登记到 TaskControlToken 实现暂停）；
     /// 默认 nil 不改变现有调用行为。
+    /// stallTimeout 非空时启用停滞看门狗：进程连续这么多秒没有任何 stdout/stderr 输出
+    /// 即视为挂死，强杀进程树并抛 ProcessStalledError（isSuspended 返回 true 期间不计时，
+    /// 避免误杀被 SIGSTOP 暂停的进程）。
     static func runStreamingProcess(
         executable: String,
         arguments: [String],
         currentDirectory: URL? = nil,
+        stallTimeout: TimeInterval? = nil,
+        isSuspended: (@Sendable () -> Bool)? = nil,
         onStart: (@Sendable (Int32) -> Void)? = nil,
         onLine: @escaping @Sendable (String) -> Void
     ) async throws -> (status: Int32, stderrTail: String) {
@@ -1114,12 +1273,20 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 process.terminationHandler = { finished in
                     let status = finished.terminationStatus
                     DispatchQueue.global().async {
+                        state.cancelStallTimer()
                         // 等两条管道 EOF（带兜底超时，防极端情况下挂起）再收尾。
                         _ = ioGroup.wait(timeout: .now() + 5)
                         outPipe.fileHandleForReading.readabilityHandler = nil
                         errPipe.fileHandleForReading.readabilityHandler = nil
                         for line in state.flushRemainder() { onLine(line) }
-                        state.resumeOnce { continuation.resume(returning: status) }
+                        state.resumeOnce {
+                            // 用户取消优先于停滞（取消也会让进程无输出退出）
+                            if state.isStalled, !state.isCancelled {
+                                continuation.resume(throwing: ProcessStalledError())
+                            } else {
+                                continuation.resume(returning: status)
+                            }
+                        }
                     }
                 }
 
@@ -1137,8 +1304,26 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                     }
                     return
                 }
-                if state.register(process) { state.cancel() }
-                else { onStart?(process.processIdentifier) }
+                if state.register(process) {
+                    state.cancel()
+                } else {
+                    onStart?(process.processIdentifier)
+                    if let stallTimeout {
+                        let timer = DispatchSource.makeTimerSource(queue: .global())
+                        let interval = max(5, min(15, stallTimeout / 4))
+                        timer.schedule(deadline: .now() + interval, repeating: interval)
+                        timer.setEventHandler {
+                            // 暂停（SIGSTOP）期间进程必然无输出：刷新计时而不是误杀。
+                            if isSuspended?() == true {
+                                state.touch()
+                                return
+                            }
+                            state.killIfSilent(longerThan: stallTimeout)
+                        }
+                        state.setStallTimer(timer)
+                        timer.resume()
+                    }
+                }
             }
         } onCancel: {
             state.cancel()

@@ -45,7 +45,9 @@ final class ViewModel: ObservableObject {
         }
     }
     @Published var chineseMode: ChineseSubtitleMode = .off
-    @Published var settings = AppSettings.load()
+    @Published var settings = AppSettings.load() {
+        didSet { queue.syncConcurrency(from: settings) }
+    }
     @Published var showSettings = false
     /// 非 nil 时弹出站点登录窗（值为站点 host，如 "youtube.com"）
     @Published var loginSite: String?
@@ -138,6 +140,7 @@ final class ViewModel: ObservableObject {
         enqueueNotice = nil
         stage = .resolving
         chosenCandidate = nil
+        parseTask?.cancel()
         parseTask = Task {
             do {
                 let found = try await self.engine.resolveCandidates(for: input)
@@ -161,7 +164,7 @@ final class ViewModel: ObservableObject {
         var seen = Set<String>()
         var urls: [String] = []
         for raw in input.components(separatedBy: .whitespacesAndNewlines) {
-            let token = raw.trimmingCharacters(in: CharacterSet(charactersIn: ",;，；、"))
+            let token = raw.trimmingCharacters(in: CharacterSet(charactersIn: ",;，；、。.)）]》〉>」』\"'"))
             guard token.lowercased().hasPrefix("http"),
                   let url = URL(string: token),
                   let scheme = url.scheme?.lowercased(),
@@ -191,6 +194,7 @@ final class ViewModel: ObservableObject {
         chosenCandidate = nil
         stage = .resolving
         let currentSettings = settings
+        parseTask?.cancel()
         parseTask = Task {
             var added = 0
             var duplicated = 0
@@ -299,6 +303,7 @@ final class ViewModel: ObservableObject {
         failedNeedsLogin = nil
         chosenCandidate = candidate
         stage = .analyzing
+        parseTask?.cancel()
         parseTask = Task {
             do {
                 var info = try await self.engine.analyze(url: candidate.url)

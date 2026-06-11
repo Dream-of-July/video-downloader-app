@@ -272,9 +272,17 @@ struct ContentView: View {
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                Text("保存到 ~/Downloads · 加入后可继续粘贴下一条")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                // 重复入队等提示就地显示，避免点了按钮毫无反馈
+                if let notice = model.enqueueNotice {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                } else {
+                    Text("保存到 ~/Downloads · 加入后可继续粘贴下一条")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .frame(maxWidth: 500)
             .padding(.horizontal, 20)
@@ -433,41 +441,10 @@ struct ContentView: View {
     // MARK: - 队列区
 
     private var queueSection: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("下载队列")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if model.queue.hasFinishedItems {
-                    Button("清除已完成") {
-                        model.queue.clearFinished()
-                    }
-                    .buttonStyle(.link)
-                    .font(.caption)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
-            Divider()
-            ScrollView {
-                VStack(spacing: 0) {
-                    ForEach(model.queue.items) { item in
-                        QueueItemView(
-                            item: item,
-                            onPause: { model.queue.pause(item.id) },
-                            onResume: { model.queue.resume(item.id) },
-                            onCancel: { model.queue.cancel(item.id) },
-                            onRetry: { model.queue.retry(item.id) },
-                            onRemove: { model.queue.remove(item.id) },
-                            onReveal: { model.queue.revealInFinder(item.id) }
-                        )
-                        Divider().padding(.leading, 86)
-                    }
-                }
-                .padding(.vertical, 4)
-            }
-        }
+        // 独立子视图直接观察 QueueManager：进度/状态变更只重绘队列区，
+        // 不经 ViewModel（它从不转发 queue.objectWillChange——以前这正是
+        // 「进度条冻结、按钮不翻转」的根因）。
+        QueueSectionView(queue: model.queue)
     }
 
     private func failedState(_ message: String) -> some View {

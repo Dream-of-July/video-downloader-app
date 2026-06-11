@@ -720,30 +720,55 @@ public struct ConfiguredTranslator: SubtitleTranslator {
         // 翻译前清洗：消除 YouTube 自动字幕的重叠滚动碎句、按句合并，减少疯狂刷新。
         let cues = cleanCues(parsed)
 
-        // 逐块顺序请求；编号用全局序号（1 起）保证块内唯一、回贴不串行。
+        // 分块并行请求（最多 3 个在途）：编号用全局序号（1 起），回贴与完成顺序无关。
+        // 每调度一个新块前过一次 gate（暂停挂起 / 取消抛出）；在途块自然跑完。
         var output = cues
-        var position = 0
-        while position < cues.count {
-            if Task.isCancelled { throw VDLError.cancelled }
-            // 分块前请求闸门：暂停时挂起、取消时抛出（与上面的 Task.isCancelled 并存）。
-            try await control?.gate()
-            let upper = min(position + Self.chunkSize, cues.count)
-            let chunk = cues[position..<upper]
-            let translated = try await translateChunk(chunk, startNumber: position + 1, depth: 0)
-            for offset in 0..<chunk.count {
-                let cueIndex = position + offset
-                // 某条缺失就保留原文（output 初始即原文）
-                guard let chinese = translated[cueIndex + 1], !chinese.isEmpty else { continue }
-                switch style {
-                case .bilingual:
-                    // 中文在上、原文在下（烧录时原文用更小字号）
-                    output[cueIndex].text = chinese + "\n" + cues[cueIndex].text
-                case .chineseOnly:
-                    output[cueIndex].text = chinese
+        var chunkRanges: [Range<Int>] = []
+        var rangeStart = 0
+        while rangeStart < cues.count {
+            let upper = min(rangeStart + Self.chunkSize, cues.count)
+            chunkRanges.append(rangeStart..<upper)
+            rangeStart = upper
+        }
+        let maxInFlight = 3
+        var merged: [Int: String] = [:]
+        var completedCues = 0
+        let allCues = cues
+        try await withThrowingTaskGroup(of: (Range<Int>, [Int: String]).self) { group in
+            var nextChunk = 0
+            func scheduleNext() async throws {
+                guard nextChunk < chunkRanges.count else { return }
+                if Task.isCancelled { throw VDLError.cancelled }
+                try await control?.gate()
+                let range = chunkRanges[nextChunk]
+                nextChunk += 1
+                group.addTask {
+                    let mapping = try await self.translateChunk(
+                        allCues[range], startNumber: range.lowerBound + 1, depth: 0
+                    )
+                    return (range, mapping)
                 }
             }
-            progress(Double(upper) / Double(cues.count))
-            position = upper
+            for _ in 0..<min(maxInFlight, chunkRanges.count) {
+                try await scheduleNext()
+            }
+            while let (range, mapping) = try await group.next() {
+                merged.merge(mapping) { _, new in new }
+                completedCues += range.count
+                progress(Double(completedCues) / Double(cues.count))
+                try await scheduleNext()
+            }
+        }
+        for cueIndex in 0..<cues.count {
+            // 某条缺失就保留原文（output 初始即原文）
+            guard let chinese = merged[cueIndex + 1], !chinese.isEmpty else { continue }
+            switch style {
+            case .bilingual:
+                // 中文在上、原文在下（烧录时原文用更小字号）
+                output[cueIndex].text = chinese + "\n" + cues[cueIndex].text
+            case .chineseOnly:
+                output[cueIndex].text = chinese
+            }
         }
 
         // 写 "<原文件名去.srt>.zh.srt"

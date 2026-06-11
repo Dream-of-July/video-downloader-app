@@ -5,6 +5,15 @@ import Foundation
 /// 把 App 内 WKWebView 登录后取到的 cookies 导出成 yt-dlp 可读的 Netscape 格式文件。
 /// 文件属于登录凭证，权限固定 0600，只落在本地 Application Support 目录。
 public enum NetscapeCookieFile {
+    /// 凭证文件创建属性：POSIX 平台 0600；Windows 无 POSIX 权限位（详见 docs/WINDOWS.md）。
+    static var secureFileAttributes: [FileAttributeKey: Any]? {
+        #if os(Windows)
+        return nil
+        #else
+        return [.posixPermissions: 0o600]
+        #endif
+    }
+
 
     /// 写入 Netscape 格式 cookies 文件（覆盖旧内容）。
     /// - 首行固定 "# Netscape HTTP Cookie File"。
@@ -47,7 +56,7 @@ public enum NetscapeCookieFile {
         let created = fm.createFile(
             atPath: url.path,
             contents: data,
-            attributes: [.posixPermissions: 0o600]
+            attributes: Self.secureFileAttributes
         )
         guard created else {
             try? fm.removeItem(at: url)
