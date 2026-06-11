@@ -245,6 +245,19 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         Self.locateBinary(named: "ffprobe", envVar: "VDL_FFPROBE_PATH")
     }
 
+    /// 子进程环境。GUI App 从 Finder 启动时 PATH 只有系统目录，而 yt-dlp 解
+    /// YouTube 的 n-challenge 必须能找到 Homebrew 里的 deno/node（JS 运行时），
+    /// 否则所有视频格式都会被跳过（"Requested format is not available"）。
+    static func subprocessEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        var parts = (env["PATH"] ?? "/usr/bin:/bin").components(separatedBy: ":")
+        for dir in ["/usr/local/bin", "/opt/homebrew/bin"] where !parts.contains(dir) {
+            parts.insert(dir, at: 0)
+        }
+        env["PATH"] = parts.joined(separator: ":")
+        return env
+    }
+
     // MARK: 站点登录 cookies
 
     /// 站点登录导出的 cookies 文件存在时，所有 yt-dlp 调用都带上 --cookies。
@@ -774,6 +787,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: executable)
                     process.arguments = arguments
+                    process.environment = Self.subprocessEnvironment()
                     process.standardInput = FileHandle.nullDevice
                     let outPipe = Pipe()
                     let errPipe = Pipe()
@@ -848,6 +862,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: executable)
                 process.arguments = arguments
+                process.environment = Self.subprocessEnvironment()
                 if let currentDirectory { process.currentDirectoryURL = currentDirectory }
                 process.standardInput = FileHandle.nullDevice
                 let outPipe = Pipe()
