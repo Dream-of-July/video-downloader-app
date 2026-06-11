@@ -245,6 +245,34 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         Self.locateBinary(named: "ffprobe", envVar: "VDL_FFPROBE_PATH")
     }
 
+    // MARK: 站点登录 cookies
+
+    /// 站点登录导出的 cookies 文件存在时，所有 yt-dlp 调用都带上 --cookies。
+    private static func cookieArguments() -> [String] {
+        let cookieFile = AppSettings.cookieFileURL
+        guard FileManager.default.fileExists(atPath: cookieFile.path) else { return [] }
+        return ["--cookies", cookieFile.path]
+    }
+
+    /// 识别"需要登录"类错误。命中返回 loginRequired，否则返回 nil 走常规文案。
+    private static func detectLoginRequired(stderr: String, url urlString: String) -> VDLError? {
+        if stderr.contains("Sign in to confirm") {
+            return .loginRequired("youtube.com")
+        }
+        let host = (URL(string: urlString)?.host ?? "").lowercased()
+        // YouTube 的 403 实质是 PO token / 未登录，登录 cookies 是正解；其他站点的 403 保持防盗链文案。
+        if isYouTubeHost(host), stderr.contains("HTTP Error 403") {
+            return .loginRequired("youtube.com")
+        }
+        let pattern = "login required|need to log ?in|account cookies|members?[- ]only|大会员|请登录"
+        if stderr.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil {
+            var site = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+            if site.isEmpty { site = "该站点" }
+            return .loginRequired(site)
+        }
+        return nil
+    }
+
     // MARK: 信息缓存
 
     private func cachedInfo(for url: String) -> [String: Any]? {
@@ -278,8 +306,11 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             return [VideoCandidate(url: trimmed, kind: .supported, title: title, detail: detail)]
 
         case .failure(let stderr):
+            if let loginError = Self.detectLoginRequired(stderr: stderr, url: trimmed) {
+                throw loginError
+            }
             if Self.isYouTubeHost(url.host ?? "") {
-                throw VDLError.analyzeFailed(Self.friendlyAnalyzeReason(stderr: stderr))
+                throw VDLError.analyzeFailed(Self.summarizeStderr(stderr))
             }
             let candidates: [VideoCandidate]
             do {
@@ -309,7 +340,10 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 setCachedInfo(dict, for: trimmed)
                 json = dict
             case .failure(let stderr):
-                throw VDLError.analyzeFailed(Self.friendlyAnalyzeReason(stderr: stderr))
+                if let loginError = Self.detectLoginRequired(stderr: stderr, url: trimmed) {
+                    throw loginError
+                }
+                throw VDLError.analyzeFailed(Self.summarizeStderr(stderr))
             }
         }
         return await buildVideoInfo(sourceURL: trimmed, json: json)
@@ -325,7 +359,8 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         let ffmpegDir = try ffmpegDirectory()
         let output = try await Self.runProcess(
             executable: ytdlp,
-            arguments: ["-J", "--no-playlist", "--ffmpeg-location", ffmpegDir, url],
+            arguments: ["-J", "--no-playlist", "--ffmpeg-location", ffmpegDir]
+                + Self.cookieArguments() + [url],
             timeout: 60
         )
         if output.timedOut {
@@ -559,6 +594,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             "-P", destDir.path,
             "-o", Self.outputTemplate(preferredTitle: request.preferredTitle),
         ]
+        args += Self.cookieArguments()
         if request.formatID == "audio" {
             args += ["-f", "ba/b", "-x", "--audio-format", "m4a"]
         } else {
@@ -598,6 +634,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         }
 
         guard status == 0 else {
+            if let loginError = Self.detectLoginRequired(stderr: stderrTail, url: request.url) {
+                throw loginError
+            }
             throw VDLError.downloadFailed(Self.friendlyDownloadReason(stderrTail: stderrTail))
         }
         progress(DownloadProgress(phase: .finished, percent: 100))
@@ -672,11 +711,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     }
 
     /// 两段式文案：中文主句 + 换行 + 原始 ERROR 行（截断 200 字符），UI 分层展示。
+    /// 需要登录的情况已在上游由 detectLoginRequired 拦截为 loginRequired。
     private static func friendlyDownloadReason(stderrTail: String) -> String {
         let rawLine = summarizeStderr(stderrTail)
-        if stderrTail.contains("Sign in to confirm") {
-            return "YouTube 触发了风控验证，当前网络下 YouTube 下载不稳定。可稍后重试，或换页面里的其他视频来源。\n" + rawLine
-        }
         if stderrTail.contains("HTTP Error 403") || stderrTail.contains("403 Forbidden") {
             return "资源拒绝访问（403），可能存在防盗链或地区限制。可先在浏览器确认视频能正常播放，或换一个候选来源。\n" + rawLine
         }
@@ -777,9 +814,11 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     }
 
     /// 流式进程：stdout 按行回调（处理半行到达），stderr 保留尾部 16KB。
-    private static func runStreamingProcess(
+    /// internal：Burner 复用它跑 ffmpeg/ffprobe。currentDirectory 为 nil 时不改工作目录。
+    static func runStreamingProcess(
         executable: String,
         arguments: [String],
+        currentDirectory: URL? = nil,
         onLine: @escaping @Sendable (String) -> Void
     ) async throws -> (status: Int32, stderrTail: String) {
         let state = StreamingState()
@@ -788,6 +827,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: executable)
                 process.arguments = arguments
+                if let currentDirectory { process.currentDirectoryURL = currentDirectory }
                 process.standardInput = FileHandle.nullDevice
                 let outPipe = Pipe()
                 let errPipe = Pipe()
@@ -860,13 +900,6 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         return h == "youtu.be"
             || h == "youtube.com" || h.hasSuffix(".youtube.com")
             || h == "youtube-nocookie.com" || h.hasSuffix(".youtube-nocookie.com")
-    }
-
-    private static func friendlyAnalyzeReason(stderr: String) -> String {
-        if stderr.contains("Sign in to confirm") {
-            return "YouTube 触发了风控验证，当前网络下 YouTube 下载不稳定。可稍后重试，或换页面里的其他视频来源"
-        }
-        return summarizeStderr(stderr)
     }
 
     private static func summarizeStderr(_ text: String) -> String {

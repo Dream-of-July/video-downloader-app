@@ -25,6 +25,25 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.prefillFromClipboardIfAppropriate()
         }
+        .sheet(isPresented: $model.showSettings, onDismiss: { model.consumePendingLogin() }) {
+            SettingsView(model: model)
+        }
+        .sheet(isPresented: loginSheetBinding) {
+            if let site = model.loginSite {
+                LoginSheet(
+                    site: site,
+                    onComplete: { model.loginCompleted() },
+                    onCancel: { model.cancelLogin() }
+                )
+            }
+        }
+    }
+
+    private var loginSheetBinding: Binding<Bool> {
+        Binding(
+            get: { model.loginSite != nil },
+            set: { if !$0 { model.loginSite = nil } }
+        )
     }
 
     // MARK: - 顶部输入区
@@ -41,6 +60,13 @@ struct ContentView: View {
                     || model.isDownloadingStage
                     || model.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
+            Button {
+                model.showSettings = true
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.bordered)
+            .help("设置")
         }
         .frame(maxWidth: 500)
     }
@@ -92,6 +118,10 @@ struct ContentView: View {
             readyState(info)
         case .downloading(let info):
             downloadingState(info)
+        case .translating(let info):
+            pipelineState(info, label: "正在翻译字幕…")
+        case .burning(let info):
+            pipelineState(info, label: "正在烧录字幕…")
         case .done(let info, let result):
             doneState(info, result)
         case .failed(let message):
@@ -207,6 +237,9 @@ struct ContentView: View {
                     }
                     section("字幕") {
                         subtitleRows(info)
+                    }
+                    section("中文字幕") {
+                        chineseSubtitleRows(info)
                     }
                 }
                 .frame(maxWidth: 500)
@@ -337,6 +370,39 @@ struct ContentView: View {
         )
     }
 
+    /// 「中文字幕」分组：依赖上方至少勾选一条字幕；翻译服务未配置时给出入口。
+    private func chineseSubtitleRows(_ info: VideoInfo) -> some View {
+        let hasSubtitleSelected = !model.selectedSubtitleIDs.isEmpty
+        return VStack(alignment: .leading, spacing: 8) {
+            Picker("中文字幕", selection: $model.chineseMode) {
+                ForEach(ChineseSubtitleMode.allCases, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
+            .disabled(!hasSubtitleSelected)
+            if !hasSubtitleSelected {
+                Text("先在上面勾选一条字幕")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if !model.settings.isTranslationConfigured {
+                HStack(spacing: 8) {
+                    Text("未配置翻译服务")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("去设置") {
+                        model.showSettings = true
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func downloadingState(_ info: VideoInfo) -> some View {
         VStack(spacing: 0) {
             ScrollView {
@@ -404,6 +470,49 @@ struct ContentView: View {
         .background(cardBackground)
     }
 
+    /// 翻译 / 烧录阶段：保留信息卡 + 流水线进度 + 取消。
+    private func pipelineState(_ info: VideoInfo, label: String) -> some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    infoCard(info)
+                    pipelineCard(label)
+                }
+                .frame(maxWidth: 500)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity)
+            }
+            Button("取消") {
+                model.cancelDownload()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .padding(.vertical, 14)
+        }
+    }
+
+    private func pipelineCard(_ label: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let p = model.pipelineProgress {
+                let clamped = min(max(p, 0), 1)
+                ProgressView(value: clamped)
+                Text("\(label)（\(Int(clamped * 100))%）")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView()
+                    .progressViewStyle(.linear)
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(cardBackground)
+    }
+
     private func doneState(_ info: VideoInfo, _ result: DownloadResult) -> some View {
         ScrollView {
             VStack(spacing: 16) {
@@ -413,6 +522,11 @@ struct ContentView: View {
                     .padding(.top, 24)
                 Text("下载完成")
                     .font(.title3.weight(.semibold))
+                if let notice = model.doneNotice {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 if !result.files.isEmpty {
                     VStack(spacing: 0) {
                         ForEach(Array(result.files.enumerated()), id: \.element) { index, file in
@@ -491,10 +605,21 @@ struct ContentView: View {
                         .frame(maxWidth: 420)
                 }
                 HStack(spacing: 10) {
-                    Button("重试") {
-                        model.retry()
+                    if model.failedNeedsLogin != nil {
+                        Button("去登录") {
+                            model.openLoginForFailure()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("重试") {
+                            model.retry()
+                        }
+                        .buttonStyle(.bordered)
+                    } else {
+                        Button("重试") {
+                            model.retry()
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
-                    .buttonStyle(.borderedProminent)
                     Button("重新开始") {
                         model.reset()
                         urlFieldFocused = true

@@ -1,0 +1,53 @@
+import Foundation
+
+// MARK: - Netscape cookies.txt
+
+/// 把 App 内 WKWebView 登录后取到的 cookies 导出成 yt-dlp 可读的 Netscape 格式文件。
+/// 文件属于登录凭证，权限固定 0600，只落在本地 Application Support 目录。
+public enum NetscapeCookieFile {
+
+    /// 写入 Netscape 格式 cookies 文件（覆盖旧内容）。
+    /// - 首行固定 "# Netscape HTTP Cookie File"。
+    /// - 每行 7 个制表符分隔字段：domain、includeSubdomains、path、secure、expiry、name、value；
+    ///   domain 以 "." 开头时 includeSubdomains 为 TRUE。
+    /// - session cookie 的 expiry 写 0。
+    /// - 字段里含制表符或换行会破坏行格式，这类 cookie 直接跳过。
+    /// - 自动创建父目录，文件权限设为 0600。
+    public static func write(cookies: [HTTPCookie], to url: URL) throws {
+        var lines = ["# Netscape HTTP Cookie File"]
+        for cookie in cookies {
+            let textFields = [cookie.domain, cookie.path, cookie.name, cookie.value]
+            if textFields.contains(where: { field in
+                field.contains("\t") || field.contains("\n") || field.contains("\r")
+            }) {
+                continue
+            }
+            let includeSubdomains = cookie.domain.hasPrefix(".") ? "TRUE" : "FALSE"
+            let secure = cookie.isSecure ? "TRUE" : "FALSE"
+            let expiry: Int
+            if cookie.isSessionOnly {
+                expiry = 0
+            } else if let date = cookie.expiresDate {
+                expiry = max(0, Int(date.timeIntervalSince1970))
+            } else {
+                expiry = 0
+            }
+            lines.append([
+                cookie.domain, includeSubdomains, cookie.path,
+                secure, String(expiry), cookie.name, cookie.value,
+            ].joined(separator: "\t"))
+        }
+
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let data = Data((lines.joined(separator: "\n") + "\n").utf8)
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    /// 删除 cookies 文件（清除登录态）；文件不存在时静默忽略。
+    public static func clear(at url: URL) {
+        try? FileManager.default.removeItem(at: url)
+    }
+}

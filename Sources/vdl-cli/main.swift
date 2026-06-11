@@ -15,12 +15,91 @@ let usageText = """
   vdl-cli analyze <url>
   vdl-cli download <url> --video-id <id> --format <formatID> \
 [--subs en,zh] [--auto-subs en] [--dest 路径]
+  vdl-cli translate <srt路径> [--style bilingual|zh] [--base 服务地址] [--model 模型] [--token 凭证]
+  vdl-cli burn <视频> <srt>
+  vdl-cli ping-llm [--base 服务地址] [--model 模型] [--token 凭证]
+
+说明：
+  --base/--model/--token 缺省读 App 设置；--token 仅供本机调试，输出时只显示前 6 位。
 """
 
 func splitLangs(_ value: String) -> [String] {
     value.split(separator: ",")
         .map { $0.trimmingCharacters(in: .whitespaces) }
         .filter { !$0.isEmpty }
+}
+
+/// 凭证脱敏：只显示前 6 位，绝不回显完整值。
+func maskToken(_ token: String) -> String {
+    String(token.prefix(6)) + "…"
+}
+
+/// 解析 translate / ping-llm 共用的 LLM 相关 flags，覆盖到 settings；返回 token 是否被命令行覆盖。
+func applyLLMFlags(
+    _ arguments: [String], startingAt start: Int,
+    settings: inout AppSettings, style: inout SubtitleStyle, allowStyle: Bool
+) -> Bool {
+    var index = start
+    var tokenOverridden = false
+    while index < arguments.count {
+        let flag = arguments[index]
+        guard index + 1 < arguments.count else {
+            printErr("选项 \(flag) 缺少取值。")
+            exit(1)
+        }
+        let value = arguments[index + 1]
+        switch flag {
+        case "--style" where allowStyle:
+            switch value {
+            case "bilingual": style = .bilingual
+            case "zh": style = .chineseOnly
+            default:
+                printErr("未知字幕样式：\(value)（支持 bilingual / zh）")
+                exit(1)
+            }
+        case "--base":
+            settings.translationBaseURL = value
+        case "--model":
+            settings.translationModel = value
+        case "--token":
+            settings.translationAuthToken = value
+            tokenOverridden = true
+        default:
+            printErr("未知选项：\(flag)\n" + usageText)
+            exit(1)
+        }
+        index += 2
+    }
+    return tokenOverridden
+}
+
+/// 0...1 进度打印：单行刷新。
+final class PercentPrinter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let label: String
+    private var lineOpen = false
+
+    init(label: String) {
+        self.label = label
+    }
+
+    func update(_ fraction: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        let percent = Int((min(max(fraction, 0), 1) * 100).rounded())
+        print("\r\(label) \(percent)%   ", terminator: "")
+        fflush(stdout)
+        lineOpen = true
+    }
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        if lineOpen {
+            print("")
+            lineOpen = false
+        }
+    }
 }
 
 /// 下载进度打印：下载中单行刷新，阶段切换时换行。
@@ -169,6 +248,57 @@ do {
         for file in result.files {
             print("  \(file.path)")
         }
+
+    case "translate":
+        guard cliArguments.count >= 2 else {
+            printErr("缺少 srt 文件路径。\n" + usageText)
+            exit(1)
+        }
+        let srtURL = URL(fileURLWithPath: (cliArguments[1] as NSString).expandingTildeInPath)
+        var settings = AppSettings.load()
+        var style = settings.subtitleStyle
+        let tokenOverridden = applyLLMFlags(
+            cliArguments, startingAt: 2,
+            settings: &settings, style: &style, allowStyle: true
+        )
+        if tokenOverridden {
+            print("使用命令行凭证：\(maskToken(settings.translationAuthToken))")
+        }
+        let translator = makeTranslator(settings: settings)
+        let printer = PercentPrinter(label: "翻译中")
+        let outputURL = try await translator.translate(srtFile: srtURL, style: style) {
+            printer.update($0)
+        }
+        printer.finish()
+        print("译文文件：\(outputURL.path)")
+
+    case "burn":
+        guard cliArguments.count >= 3 else {
+            printErr("burn 需要视频与 srt 两个路径。\n" + usageText)
+            exit(1)
+        }
+        let videoURL = URL(fileURLWithPath: (cliArguments[1] as NSString).expandingTildeInPath)
+        let subtitleURL = URL(fileURLWithPath: (cliArguments[2] as NSString).expandingTildeInPath)
+        let burner = makeBurner()
+        let printer = PercentPrinter(label: "烧录中")
+        let outputURL = try await burner.burn(video: videoURL, subtitle: subtitleURL) {
+            printer.update($0)
+        }
+        printer.finish()
+        print("输出文件：\(outputURL.path)")
+
+    case "ping-llm":
+        var settings = AppSettings.load()
+        var style = settings.subtitleStyle
+        let tokenOverridden = applyLLMFlags(
+            cliArguments, startingAt: 1,
+            settings: &settings, style: &style, allowStyle: false
+        )
+        if tokenOverridden {
+            print("使用命令行凭证：\(maskToken(settings.translationAuthToken))")
+        }
+        let reply = try await testTranslationConnection(settings: settings)
+        print("服务回复：\(reply)")
 
     default:
         printErr("未知命令：\(command)\n" + usageText)
