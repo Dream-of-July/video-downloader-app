@@ -66,6 +66,7 @@ struct QueueItemView: View {
         case .queued:
             return "排队中…"
         case .downloading:
+            if item.isPostDownloadProcessing { return "处理中…" }
             if let p = item.progress { return "下载中 \(Int(p * 100))%" }
             return "下载中…"
         case .translating:
@@ -127,7 +128,9 @@ struct QueueItemView: View {
             }
         case .done:
             HStack(spacing: 6) {
-                iconButton("folder", help: "在访达中显示", action: onReveal)
+                if !item.resultFiles.isEmpty {
+                    iconButton("folder", help: "在访达中显示", action: onReveal)
+                }
                 iconButton("trash", help: "移除", action: onRemove)
             }
         case .failed:
@@ -153,5 +156,6 @@ struct QueueItemView: View {
         }
         .buttonStyle(.bordered)
         .help(help)
+        .accessibilityLabel(help)
     }
 }

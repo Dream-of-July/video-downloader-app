@@ -16,10 +16,13 @@ struct ContentView: View {
                 .padding(.bottom, 12)
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            Divider()
-            queueSection
-                .frame(maxWidth: .infinity)
-                .frame(height: 260)
+            // 队列为空时折叠底部区，首屏只保留上方主引导；有任务时展开滚动区。
+            if !model.queue.items.isEmpty {
+                Divider()
+                queueSection
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 260)
+            }
         }
         .frame(minWidth: 540, minHeight: 720)
         .onAppear {
@@ -29,6 +32,7 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.prefillFromClipboardIfAppropriate()
         }
+        .onChange(of: model.requestUrlFocus) { urlFieldFocused = true }
         .sheet(isPresented: $model.showSettings, onDismiss: { model.consumePendingLogin() }) {
             SettingsView(model: model)
         }
@@ -414,34 +418,39 @@ struct ContentView: View {
     // MARK: - 队列区
 
     private var queueSection: some View {
-        Group {
-            if model.queue.items.isEmpty {
-                VStack {
-                    Spacer()
-                    Text("队列为空，解析并加入视频后在此查看进度")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    VStack(spacing: 0) {
-                        ForEach(model.queue.items) { item in
-                            QueueItemView(
-                                item: item,
-                                onPause: { model.queue.pause(item.id) },
-                                onResume: { model.queue.resume(item.id) },
-                                onCancel: { model.queue.cancel(item.id) },
-                                onRetry: { model.queue.retry(item.id) },
-                                onRemove: { model.queue.remove(item.id) },
-                                onReveal: { model.queue.revealInFinder(item.id) }
-                            )
-                            Divider().padding(.leading, 86)
-                        }
+        VStack(spacing: 0) {
+            HStack {
+                Text("下载队列")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if model.queue.hasFinishedItems {
+                    Button("清除已完成") {
+                        model.queue.clearFinished()
                     }
-                    .padding(.vertical, 4)
+                    .buttonStyle(.link)
+                    .font(.caption)
                 }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            Divider()
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(model.queue.items) { item in
+                        QueueItemView(
+                            item: item,
+                            onPause: { model.queue.pause(item.id) },
+                            onResume: { model.queue.resume(item.id) },
+                            onCancel: { model.queue.cancel(item.id) },
+                            onRetry: { model.queue.retry(item.id) },
+                            onRemove: { model.queue.remove(item.id) },
+                            onReveal: { model.queue.revealInFinder(item.id) }
+                        )
+                        Divider().padding(.leading, 86)
+                    }
+                }
+                .padding(.vertical, 4)
             }
         }
     }

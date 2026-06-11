@@ -126,14 +126,17 @@ func cleanCues(_ input: [SubtitleCue]) -> [SubtitleCue] {
     let overlapRatio = timed.count >= 2 ? Double(overlapCount) / Double(timed.count - 1) : 0
     let isRolling = overlapRatio > 0.5
 
-    // (b) 去重叠：end 截断到下一条 start，过短则给最小 0.3s
+    // (b) 去重叠：end 截断到下一条 start，过短则补到 start+0.3s（但不越过下一条 start）
     let minDuration = 0.3
     for i in 0..<timed.count {
-        if i + 1 < timed.count {
-            timed[i].end = min(timed[i].end, timed[i + 1].start)
+        let nextStart = i + 1 < timed.count ? timed[i + 1].start : nil
+        if let nextStart {
+            timed[i].end = min(timed[i].end, nextStart)
         }
         if timed[i].end - timed[i].start < minDuration {
-            timed[i].end = timed[i].start + minDuration
+            var compensated = timed[i].start + minDuration
+            if let nextStart { compensated = min(compensated, nextStart) }
+            timed[i].end = compensated
         }
     }
 

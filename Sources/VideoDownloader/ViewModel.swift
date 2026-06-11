@@ -55,6 +55,8 @@ final class ViewModel: ObservableObject {
     @Published var settingsNotice: String?
     /// 入队成功后的一行轻提示（如「已加入队列」）
     @Published var enqueueNotice: String?
+    /// 触发器：自增时 ContentView 重新聚焦链接输入框（入队后方便继续粘贴）。
+    @Published var requestUrlFocus = 0
 
     /// 并发下载队列，贯穿整个 App 生命周期。
     let queue: QueueManager
@@ -200,6 +202,11 @@ final class ViewModel: ObservableObject {
             return
         }
         guard let formatID = selectedFormatID ?? info.formats.first?.id else { return }
+        // 去重：队列里已有同源未完成任务时不再起新任务，只给一行提示。
+        if queue.hasOpenDuplicate(videoID: info.videoID, sourceURL: info.sourceURL, formatID: formatID) {
+            enqueueNotice = "该视频已在队列中"
+            return
+        }
         let chosen = info.subtitles.filter { selectedSubtitleIDs.contains($0.id) }
         let request = DownloadRequest(
             url: info.sourceURL,
@@ -229,6 +236,8 @@ final class ViewModel: ObservableObject {
         failedNeedsLogin = nil
         enqueueNotice = "已加入队列：\(info.title)"
         stage = .idle
+        // 回到 idle 后重新聚焦输入框，方便直接 Cmd+V 粘贴下一条。
+        requestUrlFocus += 1
     }
 
     /// ready 页提示用：勾选多条字幕时实际作为翻译源的那条（真实字幕优先、按解析顺序取第一条）。

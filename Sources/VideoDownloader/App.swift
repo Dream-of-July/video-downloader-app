@@ -17,11 +17,15 @@ struct VideoDownloaderApp: App {
     }
 }
 
-/// 关窗 / 退出确认文案：队列里有进行中（非暂停 / 完成 / 失败 / 取消）任务时给出提示，否则返回 nil。
+/// 关窗 / 退出确认文案：队列里有未到终态（含已暂停）的任务时给出提示，否则返回 nil。
 @MainActor
 private func abortConfirmationMessage(for model: ViewModel) -> String? {
-    let count = model.queue.activeTaskCount
+    let count = model.queue.openTaskCount
     guard count > 0 else { return nil }
+    let paused = model.queue.pausedOpenTaskCount
+    if paused > 0 {
+        return "队列中还有 \(count) 个任务（含 \(paused) 个已暂停），关闭会全部中止。"
+    }
     return "队列中还有 \(count) 个任务在进行，关闭会全部中止。"
 }
 

@@ -38,8 +38,13 @@ final class QueueManager: ObservableObject {
         /// 已落盘的产物（下载文件、译文、烧录视频）
         var resultFiles: [URL]
         var isPaused: Bool
+        /// 下载已 100%、正在合并/转码/字幕转换（progress 为 nil 但仍处于 .downloading）。
+        /// UI 据此显示「处理中…」而非「下载中…」（避免像卡死）。
+        var isPostDownloadProcessing: Bool = false
         /// 本项流水线的控制令牌；retry 时换新的（旧的已 cancel）。
         var control: TaskControlToken
+        /// 流水线代际：每次 enqueue/retry 递增；@MainActor 写回前校验，作废陈旧回调。
+        var generation: Int = 0
         var task: Task<Void, Never>?
     }
 
@@ -83,7 +88,52 @@ final class QueueManager: ObservableObject {
         }.count
     }
 
+    /// 未到终态的任务数（queued/downloading/translating/burning，含已暂停）。
+    /// 关窗确认据此统计，避免「只剩暂停任务」时静默丢弃。
+    var openTaskCount: Int {
+        items.filter { Self.isOpen($0.stage) }.count
+    }
+
+    /// 其中处于暂停态的数量。
+    var pausedOpenTaskCount: Int {
+        items.filter { $0.isPaused && Self.isOpen($0.stage) }.count
+    }
+
+    private static func isOpen(_ stage: ItemStage) -> Bool {
+        switch stage {
+        case .queued, .downloading, .translating, .burning:
+            return true
+        case .done, .failed, .cancelled:
+            return false
+        }
+    }
+
+    /// 存在已到终态（done/failed/cancelled）的项，「清除已完成」入口据此显示。
+    var hasFinishedItems: Bool {
+        items.contains { !Self.isOpen($0.stage) }
+    }
+
     // MARK: - 入队
+
+    /// 去重键：优先 videoID，取不到用 sourceURL + formatID。
+    private static func dedupeKey(videoID: String, sourceURL: String, formatID: String) -> String {
+        let id = videoID.trimmingCharacters(in: .whitespaces)
+        if !id.isEmpty, id != "video" { return "id:" + id }
+        return "url:" + sourceURL + "|" + formatID
+    }
+
+    /// 队列里是否已有同源且未到终态（非 done/failed/cancelled）的任务。
+    func hasOpenDuplicate(videoID: String, sourceURL: String, formatID: String) -> Bool {
+        let key = Self.dedupeKey(videoID: videoID, sourceURL: sourceURL, formatID: formatID)
+        return items.contains { item in
+            guard Self.isOpen(item.stage) else { return false }
+            return Self.dedupeKey(
+                videoID: item.info.videoID,
+                sourceURL: item.request.url,
+                formatID: item.request.formatID
+            ) == key
+        }
+    }
 
     func enqueue(info: VideoInfo, request: DownloadRequest, chineseMode: ChineseSubtitleMode, settings: AppSettings) {
         let id = UUID()
@@ -119,13 +169,15 @@ final class QueueManager: ObservableObject {
         let control = current.control
         let settings = current.settings
         let mode = current.chineseMode
+        // 启动代际：每次 @MainActor 写回前校验，作废重试后陈旧回调的写入。
+        let generation = current.generation
 
         // 1. 下载
         var downloadFiles: [URL]
         if skipDownload {
             downloadFiles = current.resultFiles
         } else {
-            update(id) { $0.stage = .downloading; $0.progress = nil; $0.statusText = nil }
+            update(id) { $0.stage = .downloading; $0.progress = nil; $0.statusText = nil; $0.isPostDownloadProcessing = false }
             do {
                 let result = try await engine.download(current.request, control: control) { [weak self] p in
                     Task { @MainActor in
@@ -180,7 +232,10 @@ final class QueueManager: ObservableObject {
                 control: control
             ) { [weak self] p in
                 Task { @MainActor in
-                    self?.update(id) { $0.progress = p }
+                    self?.update(id, generation: generation) {
+                        guard $0.stage == .translating else { return }
+                        $0.progress = p
+                    }
                 }
             }
             guard item(id) != nil else { return }
@@ -216,7 +271,10 @@ final class QueueManager: ObservableObject {
                 control: control
             ) { [weak self] p in
                 Task { @MainActor in
-                    self?.update(id) { $0.progress = p }
+                    self?.update(id, generation: generation) {
+                        guard $0.stage == .burning else { return }
+                        $0.progress = p
+                    }
                 }
             }
             guard item(id) != nil else { return }
@@ -240,8 +298,14 @@ final class QueueManager: ObservableObject {
             switch p.phase {
             case .downloading:
                 $0.progress = p.percent.map { min(max($0 / 100, 0), 1) }
-            case .preparing, .processing, .finished:
+                $0.isPostDownloadProcessing = false
+            case .preparing, .finished:
                 $0.progress = nil
+                $0.isPostDownloadProcessing = false
+            case .processing:
+                // 下载 100% 后的合并/转码：进度不确定，标记为「处理中」避免像卡死。
+                $0.progress = nil
+                $0.isPostDownloadProcessing = true
             }
         }
     }
@@ -327,9 +391,11 @@ final class QueueManager: ObservableObject {
         let newControl = TaskControlToken()
         update(id) {
             $0.control = newControl
+            $0.generation += 1
             $0.stage = .queued
             $0.isPaused = false
             $0.progress = nil
+            $0.isPostDownloadProcessing = false
             $0.statusText = skipDownload ? nil : "重新下载并处理"
             if !skipDownload { $0.resultFiles = [] }
         }
@@ -344,6 +410,11 @@ final class QueueManager: ObservableObject {
     func revealInFinder(_ id: UUID) {
         guard let target = item(id), !target.resultFiles.isEmpty else { return }
         NSWorkspace.shared.activateFileViewerSelecting(target.resultFiles)
+    }
+
+    /// 一次移除所有已到终态（done/failed/cancelled）的项。
+    func clearFinished() {
+        items.removeAll { !Self.isOpen($0.stage) }
     }
 
     // MARK: - 工具
@@ -363,6 +434,12 @@ final class QueueManager: ObservableObject {
         mutate(&items[i])
     }
 
+    /// 代际校验版：仅当当前 generation 与捕获值一致时才写回，作废重试后的陈旧回调。
+    private func update(_ id: UUID, generation: Int, _ mutate: (inout QueueItem) -> Void) {
+        guard let i = index(of: id), items[i].generation == generation else { return }
+        mutate(&items[i])
+    }
+
     private func isCancellation(_ error: Error) -> Bool {
         if case VDLError.cancelled = error { return true }
         return error is CancellationError
@@ -378,8 +455,12 @@ final class QueueManager: ObservableObject {
     }
 
     /// 按勾选语言挑翻译源字幕（与 ViewModel 旧逻辑一致）：大小写不敏感、允许前缀匹配，回退第一个 .srt。
+    /// 显式排除以 ".zh.srt" 结尾的译文文件，避免 preferredLang 为空时把上次译文当源二次翻译。
     private static func pickSourceSubtitle(from files: [URL], preferredLang: String?) -> URL? {
-        let srtFiles = files.filter { $0.pathExtension.lowercased() == "srt" }
+        let srtFiles = files.filter {
+            $0.pathExtension.lowercased() == "srt"
+                && !$0.lastPathComponent.lowercased().hasSuffix(".zh.srt")
+        }
         guard let lang = preferredLang?.lowercased(), !lang.isEmpty else { return srtFiles.first }
         func langCode(of file: URL) -> String? {
             let stem = file.deletingPathExtension().lastPathComponent

@@ -165,6 +165,9 @@ public struct FFmpegBurner: SubtitleBurner {
             }
         }
         guard status == 0 else {
+            // 取消归一化：onStart 在取消时 SIGKILL 了进程树，ffmpeg 以非 0 退出，
+            // 这里识别为取消（抛 cancelled）而不是 burnFailed，避免误报「烧录失败」。
+            if control?.isCancelled == true { throw VDLError.cancelled }
             let lower = stderrTail.lowercased()
             if lower.contains("error parsing filterchain") || lower.contains("no such filter") {
                 throw VDLError.burnFailed(
@@ -263,27 +266,28 @@ public struct FFmpegBurner: SubtitleBurner {
     // MARK: 进度与参数
 
     /// 计算 -maxrate 的 k 值（CRF 编码下仅作封顶，防高复杂度片段码率失控、体积膨胀）。
-    /// 优先级：缩放后按目标高度推算 → 源整体码率 → 按源高度推算 → 缺省 6000。
-    /// 推算档位：2160p≈16000，1440p≈10000，1080p≈6000，720p≈3000，480p≈1500。
+    /// 实测校准：目标是体积压回源附近，不再用任何下限抬高低码率源。
+    /// - 不缩放：min(源整体码率 × 1.5, 按源高度档位上限)；缺源码率时退回档位上限。
+    /// - 缩放：min(目标高度档位上限, 源整体码率 × 1.5)；源更小时不浪费。
+    /// 档位上限：2160p≈16000，1440p≈10000，1080p≈6000，720p≈3000，480p≈1500。
     private static func maxrateK(
         sourceBitRateBPS: Double?,
         sourceHeight: Int?,
         targetHeight: Int?
     ) -> Int {
+        let sourceK: Int? = {
+            guard let bps = sourceBitRateBPS, bps > 0 else { return nil }
+            return Int(bps / 1000 * 1.5)
+        }()
         if let targetHeight {
-            // 缩放场景：按目标分辨率封顶，确保比源更小。
-            return bitrateForHeight(targetHeight)
+            // 缩放场景：按目标分辨率封顶，并与源码率×1.5 取 min（源更小时不浪费）。
+            let tierK = bitrateForHeight(targetHeight)
+            return min(tierK, sourceK ?? tierK)
         }
-        if let bps = sourceBitRateBPS, bps > 0 {
-            // 不缩放：以源整体码率为上限（留 10% 余量），但不低于按高度推算的下限、不超过 20000。
-            let sourceK = Int(bps / 1000 * 1.1)
-            let floorK = sourceHeight.map(bitrateForHeight) ?? 0
-            return min(max(sourceK, floorK), 20000)
-        }
-        if let sourceHeight {
-            return bitrateForHeight(sourceHeight)
-        }
-        return 6000
+        // 不缩放：以源码率×1.5 为上限，并按源高度档位封顶；缺源码率退回档位。
+        let tierK = sourceHeight.map(bitrateForHeight) ?? 6000
+        guard let sourceK else { return tierK }
+        return min(sourceK, tierK)
     }
 
     private static func bitrateForHeight(_ height: Int) -> Int {

@@ -145,13 +145,18 @@ struct SettingsView: View {
 
     private var burnQualitySection: some View {
         Section("烧录画质") {
-            Toggle(
-                "高清视频烧录时缩放到 1080p（更快更省空间，推荐）",
-                isOn: Binding(
-                    get: { draft.maxBurnHeight != nil },
-                    set: { draft.maxBurnHeight = $0 ? 1080 : nil }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(
+                    "高清视频烧录时缩放到 1080p（更快更省空间，推荐）",
+                    isOn: Binding(
+                        get: { draft.maxBurnHeight != nil },
+                        set: { draft.maxBurnHeight = $0 ? 1080 : nil }
+                    )
                 )
-            )
+                Text("关闭则按源分辨率烧录（4K 会明显更慢、文件更大）。此设置只影响烧录字幕，不影响普通下载。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
