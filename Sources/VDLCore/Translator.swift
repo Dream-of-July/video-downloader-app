@@ -260,7 +260,8 @@ public struct AnthropicTranslator: SubtitleTranslator {
                 guard let chinese = translated[cueIndex + 1], !chinese.isEmpty else { continue }
                 switch style {
                 case .bilingual:
-                    output[cueIndex].text = cues[cueIndex].text + "\n" + chinese
+                    // 中文在上、原文在下（烧录时原文用更小字号）
+                    output[cueIndex].text = chinese + "\n" + cues[cueIndex].text
                 case .chineseOnly:
                     output[cueIndex].text = chinese
                 }

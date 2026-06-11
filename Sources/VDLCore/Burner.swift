@@ -53,22 +53,39 @@ public struct FFmpegBurner: SubtitleBurner {
         let probe = await Self.probe(video: video)
         let bitrateK = Self.clampedBitrateK(probe.bitRateBPS)
 
-        // 2. 临时目录：字幕拷成 subs.srt 并把 ffmpeg 工作目录设到这里，
+        // 2. 临时目录：字幕转成 subs.ass 并把 ffmpeg 工作目录设到这里，
         //    规避 subtitles 滤镜对路径里冒号/引号/中文的转义问题。
+        //    用 ASS 而非 SRT 是为了双语两种字号：中文（首行）正常字号，原文（次行）更小。
         let fm = FileManager.default
         let tempDir = URL(fileURLWithPath: "/tmp/vdl-burn-\(UUID().uuidString)", isDirectory: true)
+        let filter: String
         do {
             try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            try fm.copyItem(at: subtitle, to: tempDir.appendingPathComponent("subs.srt"))
+            let srtText = try String(contentsOf: subtitle, encoding: .utf8)
+            let cues = parseSRT(srtText)
+            if cues.isEmpty {
+                // 解析不出来就按原样走 SRT + force_style 的老路
+                try fm.copyItem(at: subtitle, to: tempDir.appendingPathComponent("subs.srt"))
+                filter = "subtitles=subs.srt:force_style="
+                    + "'FontName=PingFang SC,FontSize=15,Outline=1,Shadow=0,MarginV=20'"
+            } else {
+                let ass = Self.makeASS(cues: cues)
+                try ass.write(
+                    to: tempDir.appendingPathComponent("subs.ass"),
+                    atomically: true, encoding: .utf8
+                )
+                filter = "subtitles=subs.ass"
+            }
+        } catch let error as VDLError {
+            try? fm.removeItem(at: tempDir)
+            throw error
         } catch {
             try? fm.removeItem(at: tempDir)
-            throw VDLError.burnFailed("无法准备临时目录：\(error.localizedDescription)")
+            throw VDLError.burnFailed("无法准备字幕临时文件：\(error.localizedDescription)")
         }
         defer { try? fm.removeItem(at: tempDir) }
 
         // 3. 滤镜与参数
-        let filter = "subtitles=subs.srt:force_style="
-            + "'FontName=PingFang SC,FontSize=15,Outline=1,Shadow=0,MarginV=20'"
         let head = ["-y", "-i", video.path, "-vf", filter]
         func tail(audio: [String]) -> [String] {
             audio + ["-movflags", "+faststart", "-nostats", "-progress", "pipe:1", "out.mp4"]
@@ -226,5 +243,88 @@ public struct FFmpegBurner: SubtitleBurner {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         return String((lines.last ?? "未知错误").prefix(200))
+    }
+
+    // MARK: ASS 生成（双语两级字号）
+
+    private static let chineseFontSize = 15
+    private static let originalFontSize = 11
+
+    /// 把 SRT 字幕转成 ASS：双语条目（首行含中日韩文字、其余行不含）首行用正常字号，
+    /// 其余行（原文）用更小字号；普通条目整条统一字号。
+    static func makeASS(cues: [SubtitleCue]) -> String {
+        var dialogues: [String] = []
+        for cue in cues {
+            guard let start = assTimestamp(cue.start), let end = assTimestamp(cue.end) else {
+                continue
+            }
+            let lines = cue.text
+                .components(separatedBy: "\n")
+                .map(escapeASSText)
+                .filter { !$0.isEmpty }
+            guard !lines.isEmpty else { continue }
+
+            // 双语条目：含中日韩文字的行排上面（正常字号），其余原文行排下面（小字号）。
+            // 不论源文件里两种语言的顺序如何，烧录出来都是中文在上。
+            let text: String
+            let cjkLines = lines.filter(Self.containsCJK)
+            let otherLines = lines.filter { !Self.containsCJK($0) }
+            if !cjkLines.isEmpty, !otherLines.isEmpty {
+                text = cjkLines.joined(separator: "\\N")
+                    + "\\N{\\fs\(originalFontSize)}"
+                    + otherLines.joined(separator: "\\N")
+            } else {
+                text = lines.joined(separator: "\\N")
+            }
+            dialogues.append("Dialogue: 0,\(start),\(end),ZH,,0,0,0,,\(text)")
+        }
+
+        let header = """
+        [Script Info]
+        ScriptType: v4.00+
+        PlayResX: 384
+        PlayResY: 288
+        WrapStyle: 0
+        ScaledBorderAndShadow: yes
+
+        [V4+ Styles]
+        Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+        Style: ZH,PingFang SC,\(chineseFontSize),&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,1,0,2,12,12,20,1
+
+        [Events]
+        Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+        """
+        return header + "\n" + dialogues.joined(separator: "\n") + "\n"
+    }
+
+    /// "00:01:02,500" → "0:01:02.50"（ASS 用厘秒）
+    private static func assTimestamp(_ srt: String) -> String? {
+        let normalized = srt.replacingOccurrences(of: ",", with: ".")
+        let parts = normalized.split(separator: ":")
+        guard parts.count == 3,
+              let h = Int(parts[0]),
+              let m = Int(parts[1]) else { return nil }
+        let secParts = parts[2].split(separator: ".")
+        guard let s = Int(secParts.first ?? ""), s < 60, m < 60 else { return nil }
+        let msString = secParts.count > 1 ? String(secParts[1].prefix(3)) : "0"
+        let ms = Int(msString.padding(toLength: 3, withPad: "0", startingAt: 0)) ?? 0
+        return String(format: "%d:%02d:%02d.%02d", h, m, s, ms / 10)
+    }
+
+    private static func containsCJK(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            (0x4E00...0x9FFF).contains(scalar.value)        // CJK 统一表意
+                || (0x3400...0x4DBF).contains(scalar.value) // 扩展 A
+                || (0x3040...0x30FF).contains(scalar.value) // 日文假名
+                || (0xAC00...0xD7AF).contains(scalar.value) // 谚文
+        }
+    }
+
+    /// ASS 文本里 {} 是样式覆盖块定界符，替换为全角避免被解析
+    private static func escapeASSText(_ line: String) -> String {
+        line.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "{", with: "｛")
+            .replacingOccurrences(of: "}", with: "｝")
+            .replacingOccurrences(of: "\\", with: "＼")
     }
 }
