@@ -29,6 +29,7 @@ final class ViewModel: ObservableObject {
     private var downloadTask: Task<Void, Never>?
     private var parseTask: Task<Void, Never>?
     private var candidates: [VideoCandidate] = []
+    private var chosenCandidate: VideoCandidate?
     private var retryAction: (@MainActor () -> Void)?
     /// 代际令牌：reset / 取消后，旧任务的回调全部作废
     private var session = 0
@@ -93,6 +94,7 @@ final class ViewModel: ObservableObject {
         let token = session
         retryAction = nil
         stage = .resolving
+        chosenCandidate = nil
         parseTask = Task {
             do {
                 let found = try await self.engine.resolveCandidates(for: input)
@@ -133,10 +135,20 @@ final class ViewModel: ObservableObject {
         session += 1
         let token = session
         retryAction = nil
+        chosenCandidate = candidate
         stage = .analyzing
         parseTask = Task {
             do {
-                let info = try await self.engine.analyze(url: candidate.url)
+                var info = try await self.engine.analyze(url: candidate.url)
+                // 直链/页面主视频的 yt-dlp 标题往往是 CDN 文件名，换成嗅探到的页面标题
+                if candidate.kind == .pageMain || candidate.kind == .directFile,
+                   !candidate.title.isEmpty, candidate.title != info.title {
+                    info = VideoInfo(
+                        sourceURL: info.sourceURL, videoID: info.videoID, title: candidate.title,
+                        durationText: info.durationText, thumbnailURL: info.thumbnailURL,
+                        uploader: info.uploader, formats: info.formats, subtitles: info.subtitles
+                    )
+                }
                 guard token == self.session else { return }
                 self.selectedFormatID = info.formats.first?.id
                 self.selectedSubtitleIDs = []
@@ -162,7 +174,11 @@ final class ViewModel: ObservableObject {
             formatID: formatID,
             subtitleLangs: chosen.filter { !$0.isAuto }.map(\.id),
             autoSubtitleLangs: chosen.filter { $0.isAuto }.map(\.id),
-            destinationDirectory: FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+            destinationDirectory: FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0],
+            preferredTitle: {
+                guard let kind = chosenCandidate?.kind, kind == .pageMain || kind == .directFile else { return nil }
+                return info.title
+            }()
         )
         session += 1
         let token = session
@@ -236,6 +252,7 @@ final class ViewModel: ObservableObject {
         selectedSubtitleIDs = []
         progress = nil
         candidates = []
+        chosenCandidate = nil
         retryAction = nil
         lastProgressPhase = nil
         lastProgressPercent = nil

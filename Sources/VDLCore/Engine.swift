@@ -529,6 +529,19 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     // MARK: - 第三步：下载
 
+    /// preferredTitle 作为字面量进入 yt-dlp 输出模板：需转义 %、去掉路径分隔符并限长。
+    private static func outputTemplate(preferredTitle: String?) -> String {
+        guard let raw = preferredTitle else { return "%(title).180B [%(id)s].%(ext)s" }
+        var clean = raw.replacingOccurrences(of: "%", with: "%%")
+        clean = clean
+            .components(separatedBy: CharacterSet(charactersIn: "/\\:\0"))
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.count > 120 { clean = String(clean.prefix(120)) }
+        guard !clean.isEmpty else { return "%(title).180B [%(id)s].%(ext)s" }
+        return "\(clean) [%(id)s].%(ext)s"
+    }
+
     public func download(
         _ request: DownloadRequest,
         progress: @escaping @Sendable (DownloadProgress) -> Void
@@ -544,7 +557,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             "download:VDLP|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
             "--ffmpeg-location", ffmpegDir,
             "-P", destDir.path,
-            "-o", "%(title).180B [%(id)s].%(ext)s",
+            "-o", Self.outputTemplate(preferredTitle: request.preferredTitle),
         ]
         if request.formatID == "audio" {
             args += ["-f", "ba/b", "-x", "--audio-format", "m4a"]
@@ -662,7 +675,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
     private static func friendlyDownloadReason(stderrTail: String) -> String {
         let rawLine = summarizeStderr(stderrTail)
         if stderrTail.contains("Sign in to confirm") {
-            return "YouTube 触发了风控验证，建议升级 yt-dlp（brew upgrade yt-dlp）后重试。\n" + rawLine
+            return "YouTube 触发了风控验证，当前网络下 YouTube 下载不稳定。可稍后重试，或换页面里的其他视频来源。\n" + rawLine
         }
         if stderrTail.contains("HTTP Error 403") || stderrTail.contains("403 Forbidden") {
             return "资源拒绝访问（403），可能存在防盗链或地区限制。可先在浏览器确认视频能正常播放，或换一个候选来源。\n" + rawLine
@@ -851,7 +864,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     private static func friendlyAnalyzeReason(stderr: String) -> String {
         if stderr.contains("Sign in to confirm") {
-            return "YouTube 触发了风控验证，建议升级 yt-dlp（brew upgrade yt-dlp）后重试"
+            return "YouTube 触发了风控验证，当前网络下 YouTube 下载不稳定。可稍后重试，或换页面里的其他视频来源"
         }
         return summarizeStderr(stderr)
     }

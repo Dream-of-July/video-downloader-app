@@ -134,11 +134,14 @@ public struct DownloadRequest: Sendable {
     /// 选中的自动字幕语言代码
     public let autoSubtitleLangs: [String]
     public let destinationDirectory: URL
+    /// 期望的文件名标题。直链/页面主视频的 yt-dlp 标题往往是 CDN 文件名
+    /// （如 "homepage_trailer"），此时用嗅探得到的页面标题命名更友好；nil 用 yt-dlp 默认标题。
+    public let preferredTitle: String?
 
     public init(
         url: String, videoID: String, formatID: String,
         subtitleLangs: [String], autoSubtitleLangs: [String],
-        destinationDirectory: URL
+        destinationDirectory: URL, preferredTitle: String? = nil
     ) {
         self.url = url
         self.videoID = videoID
@@ -146,6 +149,7 @@ public struct DownloadRequest: Sendable {
         self.subtitleLangs = subtitleLangs
         self.autoSubtitleLangs = autoSubtitleLangs
         self.destinationDirectory = destinationDirectory
+        self.preferredTitle = preferredTitle
     }
 }
 
