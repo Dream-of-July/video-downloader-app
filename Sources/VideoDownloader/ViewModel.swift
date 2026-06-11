@@ -27,10 +27,14 @@ final class ViewModel: ObservableObject {
 
     private let engine: any DownloadEngine
     private var downloadTask: Task<Void, Never>?
+    private var parseTask: Task<Void, Never>?
     private var candidates: [VideoCandidate] = []
     private var retryAction: (@MainActor () -> Void)?
     /// 代际令牌：reset / 取消后，旧任务的回调全部作废
     private var session = 0
+    /// 进度单调化：记录最近相位与百分比，丢弃回退事件
+    private var lastProgressPhase: DownloadProgress.Phase?
+    private var lastProgressPercent: Double?
 
     init(engine: any DownloadEngine = makeDefaultEngine()) {
         self.engine = engine
@@ -55,6 +59,17 @@ final class ViewModel: ObservableObject {
     // MARK: - 行为
 
     func onAppear() {
+        prefillFromClipboardIfAppropriate()
+    }
+
+    /// 视图出现或 App 激活时：处于可输入阶段且输入框为空，用剪贴板里的链接预填（不自动解析）。
+    func prefillFromClipboardIfAppropriate() {
+        switch stage {
+        case .idle, .done:
+            break
+        default:
+            return
+        }
         guard urlText.isEmpty else { return }
         guard let clip = NSPasteboard.general.string(forType: .string)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -65,11 +80,20 @@ final class ViewModel: ObservableObject {
     func parse() {
         let input = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty, !isParsing, !isDownloadingStage else { return }
+        guard let url = URL(string: input),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else {
+            session += 1
+            retryAction = nil
+            stage = .failed("这不是一个网址。请粘贴以 http 或 https 开头的视频链接。")
+            return
+        }
         session += 1
         let token = session
         retryAction = nil
         stage = .resolving
-        Task {
+        parseTask = Task {
             do {
                 let found = try await self.engine.resolveCandidates(for: input)
                 guard token == self.session else { return }
@@ -87,13 +111,30 @@ final class ViewModel: ObservableObject {
         }
     }
 
+    func cancelParse() {
+        switch stage {
+        case .resolving:
+            session += 1
+            parseTask?.cancel()
+            parseTask = nil
+            stage = .idle
+        case .analyzing:
+            session += 1
+            parseTask?.cancel()
+            parseTask = nil
+            stage = candidates.count > 1 ? .choosing(candidates) : .idle
+        default:
+            break
+        }
+    }
+
     func choose(_ candidate: VideoCandidate) {
         guard !isDownloadingStage else { return }
         session += 1
         let token = session
         retryAction = nil
         stage = .analyzing
-        Task {
+        parseTask = Task {
             do {
                 let info = try await self.engine.analyze(url: candidate.url)
                 guard token == self.session else { return }
@@ -127,13 +168,15 @@ final class ViewModel: ObservableObject {
         let token = session
         retryAction = nil
         stage = .downloading(info)
+        lastProgressPhase = .preparing
+        lastProgressPercent = nil
         progress = DownloadProgress(phase: .preparing)
         downloadTask = Task {
             do {
                 let result = try await self.engine.download(request) { [weak self] p in
                     Task { @MainActor in
                         guard let self, self.session == token else { return }
-                        self.progress = p
+                        self.applyProgress(p)
                     }
                 }
                 guard token == self.session, !Task.isCancelled else { return }
@@ -185,6 +228,8 @@ final class ViewModel: ObservableObject {
         session += 1
         downloadTask?.cancel()
         downloadTask = nil
+        parseTask?.cancel()
+        parseTask = nil
         urlText = ""
         stage = .idle
         selectedFormatID = nil
@@ -192,6 +237,8 @@ final class ViewModel: ObservableObject {
         progress = nil
         candidates = []
         retryAction = nil
+        lastProgressPhase = nil
+        lastProgressPercent = nil
     }
 
     func revealInFinder() {
@@ -200,6 +247,17 @@ final class ViewModel: ObservableObject {
     }
 
     // MARK: - 私有
+
+    /// 进度单调化：丢弃 percent 回退的下载事件；进入 processing 后不再被 downloading 覆盖。
+    private func applyProgress(_ p: DownloadProgress) {
+        if p.phase == .downloading {
+            if lastProgressPhase == .processing || lastProgressPhase == .finished { return }
+            if let percent = p.percent, let last = lastProgressPercent, percent < last { return }
+            if let percent = p.percent { lastProgressPercent = percent }
+        }
+        lastProgressPhase = p.phase
+        progress = p
+    }
 
     private func fail(_ error: Error, retry: @escaping @MainActor () -> Void) {
         retryAction = retry

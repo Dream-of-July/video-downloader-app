@@ -26,6 +26,24 @@ private final class DataBuffer: @unchecked Sendable {
     }
 }
 
+/// 收集 yt-dlp --print 输出的产出文件路径（输出回调线程并发追加）。
+private final class PathCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var paths: [String] = []
+
+    func append(_ path: String) {
+        lock.lock()
+        if !paths.contains(path) { paths.append(path) }
+        lock.unlock()
+    }
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return paths
+    }
+}
+
 /// 持有子进程引用，支持跨任务取消与超时标记。
 private final class ProcessBox: @unchecked Sendable {
     private let lock = NSLock()
@@ -90,7 +108,34 @@ private final class StreamingState: @unchecked Sendable {
         cancelled = true
         let p = process
         lock.unlock()
-        if let p, p.isRunning { p.terminate() }
+        guard let p, p.isRunning else { return }
+        // 先发 SIGINT，让 yt-dlp 走自身的 KeyboardInterrupt 清理逻辑；
+        // 3 秒后仍未退出则先杀 ffmpeg 等子进程，再强杀 yt-dlp 本身。
+        p.interrupt()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+            guard p.isRunning else { return }
+            let pid = p.processIdentifier
+            for child in Self.childProcessIDs(of: pid) {
+                kill(child, SIGKILL)
+            }
+            if p.isRunning { kill(pid, SIGKILL) }
+        }
+    }
+
+    /// 用 pgrep 找直接子进程（ffmpeg 等）。
+    private static func childProcessIDs(of pid: Int32) -> [Int32] {
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-P", String(pid)]
+        let pipe = Pipe()
+        pgrep.standardOutput = pipe
+        pgrep.standardError = FileHandle.nullDevice
+        do { try pgrep.run() } catch { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        pgrep.waitUntilExit()
+        return String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
     }
 
     var isCancelled: Bool {
@@ -281,8 +326,11 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         let output = try await Self.runProcess(
             executable: ytdlp,
             arguments: ["-J", "--no-playlist", "--ffmpeg-location", ffmpegDir, url],
-            timeout: nil
+            timeout: 60
         )
+        if output.timedOut {
+            throw VDLError.analyzeFailed("解析超时，请检查网络后重试")
+        }
         if output.status == 0,
            let object = try? JSONSerialization.jsonObject(with: output.stdout),
            var dict = object as? [String: Any] {
@@ -330,19 +378,16 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 return Self.sizeText(bytes: videoBytes + (audioBytes ?? 0))
             }
 
-            if let maxHeight = heights.first {
+            // 最高档直接排第一（formats[0] 为推荐项），用通配格式串拿最佳画质。
+            for (index, height) in heights.prefix(6).enumerated() {
+                let formatID = index == 0
+                    ? "bv*+ba/b"
+                    : "bv*[height<=\(height)]+ba/b[height<=\(height)]"
                 formats.append(FormatChoice(
-                    id: "bv*+ba/b",
-                    label: "最佳画质（\(maxHeight)p）",
-                    detail: tierDetail(maxHeight)
+                    id: formatID,
+                    label: "\(height)p · mp4",
+                    detail: tierDetail(height)
                 ))
-                for height in heights.prefix(6) {
-                    formats.append(FormatChoice(
-                        id: "bv*[height<=\(height)]+ba/b[height<=\(height)]",
-                        label: "\(height)p · mp4",
-                        detail: tierDetail(height)
-                    ))
-                }
             }
         } else {
             // 直链文件：单一格式，无分档信息。
@@ -513,15 +558,30 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
             if !request.autoSubtitleLangs.isEmpty { args.append("--write-auto-subs") }
             args += ["--convert-subs", "srt"]
         }
+        // --print 默认隐含 simulate/quiet，必须配 --no-simulate / --no-quiet 抵消。
+        args += ["--print", "after_move:filepath", "--no-simulate", "--no-quiet"]
         args.append(request.url)
 
         progress(DownloadProgress(phase: .preparing))
 
-        let (status, stderrTail) = try await Self.runStreamingProcess(
-            executable: ytdlp,
-            arguments: args
-        ) { line in
-            Self.handleOutputLine(line, progress: progress)
+        let destPrefix = destDir.path.hasSuffix("/") ? destDir.path : destDir.path + "/"
+        let printedPaths = PathCollector()
+        let status: Int32
+        let stderrTail: String
+        do {
+            (status, stderrTail) = try await Self.runStreamingProcess(
+                executable: ytdlp,
+                arguments: args
+            ) { line in
+                Self.handleOutputLine(line, progress: progress)
+                if line.hasPrefix(destPrefix) { printedPaths.append(line) }
+            }
+        } catch {
+            // 取消路径：进程已确认退出，先清掉残留的临时文件再上抛。
+            if case VDLError.cancelled = error {
+                Self.cleanupTemporaryFiles(in: destDir, videoID: request.videoID)
+            }
+            throw error
         }
 
         guard status == 0 else {
@@ -529,11 +589,40 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         }
         progress(DownloadProgress(phase: .finished, percent: 100))
 
-        let files = Self.collectOutputFiles(in: destDir, videoID: request.videoID)
+        // 优先用 --print after_move:filepath 的精确产出；目录扫描降级为兜底。
+        let fm = FileManager.default
+        var files = printedPaths.values
+            .map { URL(fileURLWithPath: $0) }
+            .filter { fm.fileExists(atPath: $0.path) }
+        if files.isEmpty {
+            files = Self.collectOutputFiles(in: destDir, videoID: request.videoID)
+        } else if !allSubLangs.isEmpty {
+            // --print 不会打印字幕文件，用目录扫描补齐字幕。
+            let known = Set(files.map(\.path))
+            files += Self.collectOutputFiles(in: destDir, videoID: request.videoID).filter {
+                Self.subtitleExtensions.contains($0.pathExtension.lowercased()) && !known.contains($0.path)
+            }
+        }
         guard !files.isEmpty else {
             throw VDLError.downloadFailed("下载进程已结束，但在目标目录里没有找到产出文件。")
         }
         return DownloadResult(files: files)
+    }
+
+    /// 取消后清理 yt-dlp 留下的临时文件（.part / .ytdl / 分片 .part-Frag…）。
+    private static func cleanupTemporaryFiles(in directory: URL, videoID: String) {
+        let marker = "[\(videoID)]"
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil
+        ) else { return }
+        for file in contents {
+            let name = file.lastPathComponent
+            guard name.contains(marker) else { continue }
+            let ext = file.pathExtension.lowercased()
+            if ext == "part" || ext == "ytdl" || name.contains(".part-Frag") {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 
     private static let processingPrefixes = [
@@ -569,19 +658,22 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         return value
     }
 
+    /// 两段式文案：中文主句 + 换行 + 原始 ERROR 行（截断 200 字符），UI 分层展示。
     private static func friendlyDownloadReason(stderrTail: String) -> String {
+        let rawLine = summarizeStderr(stderrTail)
         if stderrTail.contains("Sign in to confirm") {
-            return "YouTube 触发了风控验证，建议升级 yt-dlp（brew upgrade yt-dlp）后重试"
+            return "YouTube 触发了风控验证，建议升级 yt-dlp（brew upgrade yt-dlp）后重试。\n" + rawLine
         }
-        if stderrTail.contains("HTTP Error 403") || stderrTail.contains("403") {
-            return "资源拒绝访问（403），可能存在防盗链或地区限制"
+        if stderrTail.contains("HTTP Error 403") || stderrTail.contains("403 Forbidden") {
+            return "资源拒绝访问（403），可能存在防盗链或地区限制。可先在浏览器确认视频能正常播放，或换一个候选来源。\n" + rawLine
         }
-        return summarizeStderr(stderrTail)
+        return "下载过程中出现错误。\n" + rawLine
     }
+
+    private static let subtitleExtensions: Set<String> = ["srt", "vtt", "ass", "ssa", "lrc", "ttml"]
 
     private static func collectOutputFiles(in directory: URL, videoID: String) -> [URL] {
         let marker = "[\(videoID)]"
-        let subtitleExts: Set<String> = ["srt", "vtt", "ass", "ssa", "lrc", "ttml"]
         let tempExts: Set<String> = ["part", "ytdl", "temp"]
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: nil
@@ -589,9 +681,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         let matched = contents.filter {
             $0.lastPathComponent.contains(marker) && !tempExts.contains($0.pathExtension.lowercased())
         }
-        let videos = matched.filter { !subtitleExts.contains($0.pathExtension.lowercased()) }
+        let videos = matched.filter { !subtitleExtensions.contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        let subs = matched.filter { subtitleExts.contains($0.pathExtension.lowercased()) }
+        let subs = matched.filter { subtitleExtensions.contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         return videos + subs
     }
@@ -689,10 +781,17 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                 process.standardOutput = outPipe
                 process.standardError = errPipe
 
+                // 两条管道各自读到 EOF 后 leave；收尾统一等待，
+                // 消除 terminationHandler 与在途回调并发读同一管道的竞态。
+                let ioGroup = DispatchGroup()
+                ioGroup.enter()
+                ioGroup.enter()
+
                 outPipe.fileHandleForReading.readabilityHandler = { handle in
                     let data = handle.availableData
                     if data.isEmpty {
                         handle.readabilityHandler = nil
+                        ioGroup.leave()
                         return
                     }
                     for line in state.consumeLines(appending: data) { onLine(line) }
@@ -701,36 +800,38 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                     let data = handle.availableData
                     if data.isEmpty {
                         handle.readabilityHandler = nil
+                        ioGroup.leave()
                         return
                     }
                     state.appendStderr(data)
                 }
                 process.terminationHandler = { finished in
-                    outPipe.fileHandleForReading.readabilityHandler = nil
-                    errPipe.fileHandleForReading.readabilityHandler = nil
-                    if let rest = try? outPipe.fileHandleForReading.readToEnd(), !rest.isEmpty {
-                        for line in state.consumeLines(appending: rest) { onLine(line) }
-                    }
-                    for line in state.flushRemainder() { onLine(line) }
-                    if let rest = try? errPipe.fileHandleForReading.readToEnd(), !rest.isEmpty {
-                        state.appendStderr(rest)
-                    }
                     let status = finished.terminationStatus
-                    state.resumeOnce { continuation.resume(returning: status) }
+                    DispatchQueue.global().async {
+                        // 等两条管道 EOF（带兜底超时，防极端情况下挂起）再收尾。
+                        _ = ioGroup.wait(timeout: .now() + 5)
+                        outPipe.fileHandleForReading.readabilityHandler = nil
+                        errPipe.fileHandleForReading.readabilityHandler = nil
+                        for line in state.flushRemainder() { onLine(line) }
+                        state.resumeOnce { continuation.resume(returning: status) }
+                    }
                 }
 
                 do {
                     try process.run()
                 } catch {
                     process.terminationHandler = nil
+                    // 子进程未启动，管道不会有数据/EOF，手动配平 ioGroup。
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
+                    ioGroup.leave()
+                    ioGroup.leave()
                     state.resumeOnce {
                         continuation.resume(throwing: VDLError.downloadFailed("无法启动 yt-dlp：\(error.localizedDescription)"))
                     }
                     return
                 }
-                if state.register(process) { process.terminate() }
+                if state.register(process) { state.cancel() }
             }
         } onCancel: {
             state.cancel()

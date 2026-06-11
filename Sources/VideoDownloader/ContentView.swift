@@ -1,10 +1,12 @@
+import AppKit
 import SwiftUI
 #if canImport(VDLCore)
 import VDLCore
 #endif
 
 struct ContentView: View {
-    @StateObject private var model = ViewModel()
+    @ObservedObject var model: ViewModel
+    @FocusState private var urlFieldFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,7 +18,13 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 520, minHeight: 600)
-        .onAppear { model.onAppear() }
+        .onAppear {
+            model.onAppear()
+            urlFieldFocused = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.prefillFromClipboardIfAppropriate()
+        }
     }
 
     // MARK: - 顶部输入区
@@ -25,28 +33,48 @@ struct ContentView: View {
         HStack(spacing: 8) {
             TextField("粘贴视频链接", text: $model.urlText)
                 .textFieldStyle(.roundedBorder)
+                .focused($urlFieldFocused)
                 .onSubmit { model.parse() }
-            Button {
-                model.parse()
-            } label: {
-                Group {
-                    if model.isParsing {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Text("解析")
-                    }
-                }
-                .frame(minWidth: 36)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                model.isParsing
-                || model.isDownloadingStage
-                || model.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            )
+            parseButton
+                .disabled(
+                    model.isParsing
+                    || model.isDownloadingStage
+                    || model.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
         }
         .frame(maxWidth: 500)
+    }
+
+    /// 解析按钮：仅在 idle / failed 阶段作为主按钮，其余阶段降级为次按钮。
+    @ViewBuilder
+    private var parseButton: some View {
+        let button = Button {
+            model.parse()
+        } label: {
+            Group {
+                if model.isParsing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Text("解析")
+                }
+            }
+            .frame(minWidth: 36)
+        }
+        if parseButtonIsProminent {
+            button.buttonStyle(.borderedProminent)
+        } else {
+            button.buttonStyle(.bordered)
+        }
+    }
+
+    private var parseButtonIsProminent: Bool {
+        switch model.stage {
+        case .idle, .failed:
+            return true
+        default:
+            return false
+        }
     }
 
     // MARK: - 各阶段内容
@@ -89,6 +117,10 @@ struct ContentView: View {
                 .controlSize(.large)
             Text("正在解析…")
                 .foregroundStyle(.secondary)
+            Button("取消") {
+                model.cancelParse()
+            }
+            .buttonStyle(.bordered)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -129,6 +161,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(candidate.title)
                     .lineLimit(2)
+                    .help(candidate.title)
                 if let detail = candidate.detail {
                     Text(detail)
                         .font(.caption)
@@ -169,7 +202,7 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                     }
                     infoCard(info)
-                    section("清晰度") {
+                    section("格式") {
                         formatRows(info)
                     }
                     section("字幕") {
@@ -190,6 +223,7 @@ struct ContentView: View {
                 }
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
                 Text("保存到 ~/Downloads")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -200,42 +234,65 @@ struct ContentView: View {
         }
     }
 
+    /// 视频档位在前；其后用分隔线 + “音频”小节标渲染仅音频选项。
+    @ViewBuilder
     private func formatRows(_ info: VideoInfo) -> some View {
-        ForEach(Array(info.formats.enumerated()), id: \.element.id) { index, format in
-            Button {
-                model.selectedFormatID = format.id
-            } label: {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(format.label)
-                        if let detail = format.detail {
-                            Text(detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    Spacer()
-                    if model.selectedFormatID == format.id {
-                        Image(systemName: "checkmark")
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(Color.accentColor)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .contentShape(Rectangle())
+        let videoFormats = info.formats.filter { !$0.isAudioOnly }
+        let audioFormats = info.formats.filter { $0.isAudioOnly }
+        ForEach(Array(videoFormats.enumerated()), id: \.element.id) { index, format in
+            formatRow(format)
+            if index < videoFormats.count - 1 {
+                Divider().padding(.leading, 12)
             }
-            .buttonStyle(.plain)
-            if index < info.formats.count - 1 {
+        }
+        if !videoFormats.isEmpty && !audioFormats.isEmpty {
+            Divider()
+            Text("音频")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        ForEach(Array(audioFormats.enumerated()), id: \.element.id) { index, format in
+            formatRow(format)
+            if index < audioFormats.count - 1 {
                 Divider().padding(.leading, 12)
             }
         }
     }
 
+    private func formatRow(_ format: FormatChoice) -> some View {
+        Button {
+            model.selectedFormatID = format.id
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(format.label)
+                    if let detail = format.detail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                if model.selectedFormatID == format.id {
+                    Image(systemName: "checkmark")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
     @ViewBuilder
     private func subtitleRows(_ info: VideoInfo) -> some View {
         if info.subtitles.isEmpty {
-            Text("该视频没有可用字幕")
+            Text("这个视频没有字幕")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
@@ -308,7 +365,7 @@ struct ContentView: View {
                 case .processing:
                     ProgressView()
                         .progressViewStyle(.linear)
-                    Text("正在合并/处理…")
+                    Text("正在处理…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 default:
@@ -384,6 +441,7 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent)
                     Button("下载新视频") {
                         model.reset()
+                        urlFieldFocused = true
                     }
                     .buttonStyle(.bordered)
                 }
@@ -408,16 +466,30 @@ struct ContentView: View {
     }
 
     private func failedState(_ message: String) -> some View {
-        ScrollView {
+        // 两段式错误：第一行为中文主句，其余为原始错误详情。
+        let parts = message.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
+        let headline = parts.first.map(String.init) ?? message
+        let detail = parts.count > 1
+            ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+        return ScrollView {
             VStack(spacing: 16) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 40))
                     .foregroundStyle(.orange)
                     .padding(.top, 40)
-                Text(message)
+                Text(headline)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: 420)
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: 420)
+                }
                 HStack(spacing: 10) {
                     Button("重试") {
                         model.retry()
@@ -425,8 +497,15 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent)
                     Button("重新开始") {
                         model.reset()
+                        urlFieldFocused = true
                     }
                     .buttonStyle(.bordered)
+                    if model.canReturnToList {
+                        Button("返回列表") {
+                            model.backToList()
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
                 .controlSize(.large)
             }
@@ -471,6 +550,7 @@ struct ContentView: View {
                 Text(info.title)
                     .font(.headline)
                     .lineLimit(2)
+                    .help(info.title)
                 let meta = [info.durationText, info.uploader]
                     .compactMap { $0 }
                     .joined(separator: " · ")

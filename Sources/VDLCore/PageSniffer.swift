@@ -126,6 +126,11 @@ public struct PageSniffer {
             classify(ns.substring(with: match.range), at: match.range.location)
         }
 
+        // 7. JSON 转义的直链（https:\/\/…\/a.mp4），classify 会把 \/ 反转义后归类
+        for match in matches(#"https?:(?:\\/|/){2}[^\s"'<>]+?\.(?:mp4|m3u8|webm|mov)(?:\?[^\s"'<>]*)?"#) {
+            classify(ns.substring(with: match.range), at: match.range.location)
+        }
+
         findings.sort { $0.offset < $1.offset }
         return await buildCandidates(from: findings, html: html)
     }
@@ -262,7 +267,7 @@ public struct PageSniffer {
     // MARK: - 静态辅助
 
     private static let youtubeIDPattern =
-        #"(?:youtube(?:-nocookie)?\.com/embed/|youtube\.com/watch\?[^"'<>\s]*?v=|youtu\.be/)([A-Za-z0-9_-]{11})"#
+        #"(?:youtube(?:-nocookie)?\.com/(?:embed|shorts|live|v)/|youtube\.com/watch\?[^"'<>\s]*?v=|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])"#
     private static let vimeoIDPattern = #"player\.vimeo\.com/video/(\d+)"#
 
     private static func youtubeID(in text: String) -> String? {
