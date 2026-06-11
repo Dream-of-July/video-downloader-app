@@ -8,7 +8,8 @@ public func makeBurner() -> any SubtitleBurner {
 
 // MARK: - FFmpegBurner
 
-/// ffmpeg subtitles 滤镜硬烧录中文字幕：优先 h264_videotoolbox 硬编码，失败回退 libx264。
+/// ffmpeg subtitles 滤镜硬烧录中文字幕：libx264 + CRF 恒定质量（体积不超源），
+/// 可选 scale 缩放到 maxHeight（避开 4K60 的 H.264 编码上限、又快又小）。
 public struct FFmpegBurner: SubtitleBurner {
 
     public init() {}
@@ -50,25 +51,41 @@ public struct FFmpegBurner: SubtitleBurner {
         guard let ffmpeg = Self.locate("ffmpeg") else {
             throw VDLError.binaryNotFound("ffmpeg")
         }
+        if control?.isCancelled == true { throw VDLError.cancelled }
 
-        // 1. ffprobe 取时长与码率（取不到不阻塞烧录，只影响进度显示与码率档位）
+        // 1. ffprobe 取时长、整体码率与源高度（取不到不阻塞烧录，只影响进度与缩放/码率）
         let probe = await Self.probe(video: video)
-        let bitrateK = Self.clampedBitrateK(probe.bitRateBPS)
+
+        // 缩放目标：maxHeight 非空且源更高时缩到 maxHeight（偶数高度），否则保持源。
+        let targetHeight: Int? = {
+            guard let maxHeight, maxHeight > 0, let sourceHeight = probe.height,
+                  sourceHeight > maxHeight else { return nil }
+            return maxHeight
+        }()
+        // -maxrate 上限：缩放后按目标高度推算；不缩放时取源整体码率，缺失再按源高度推算。
+        let maxrateK = Self.maxrateK(
+            sourceBitRateBPS: probe.bitRateBPS,
+            sourceHeight: probe.height,
+            targetHeight: targetHeight
+        )
 
         // 2. 临时目录：字幕转成 subs.ass 并把 ffmpeg 工作目录设到这里，
         //    规避 subtitles 滤镜对路径里冒号/引号/中文的转义问题。
         //    用 ASS 而非 SRT 是为了双语两种字号：中文（首行）正常字号，原文（次行）更小。
         let fm = FileManager.default
         let tempDir = URL(fileURLWithPath: "/tmp/vdl-burn-\(UUID().uuidString)", isDirectory: true)
+        // 缩放滤镜：-2 让宽度自动按比例取偶数，避免 H.264 要求偶数边长报错。
+        let scaleFilter = targetHeight.map { "scale=-2:\($0)" }
         let filter: String
         do {
             try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
             let srtText = try String(contentsOf: subtitle, encoding: .utf8)
             let cues = parseSRT(srtText)
+            let subtitleFilter: String
             if cues.isEmpty {
                 // 解析不出来就按原样走 SRT + force_style 的老路
                 try fm.copyItem(at: subtitle, to: tempDir.appendingPathComponent("subs.srt"))
-                filter = "subtitles=subs.srt:force_style="
+                subtitleFilter = "subtitles=subs.srt:force_style="
                     + "'FontName=PingFang SC,FontSize=15,Outline=1,Shadow=0,MarginV=20'"
             } else {
                 let ass = Self.makeASS(cues: cues)
@@ -76,7 +93,14 @@ public struct FFmpegBurner: SubtitleBurner {
                     to: tempDir.appendingPathComponent("subs.ass"),
                     atomically: true, encoding: .utf8
                 )
-                filter = "subtitles=subs.ass"
+                subtitleFilter = "subtitles=subs.ass"
+            }
+            // 先缩放再烧字幕：字幕按目标分辨率渲染，清晰度与位置都正确。
+            // 同一条 -vf filterchain 用逗号连接。
+            if let scaleFilter {
+                filter = scaleFilter + "," + subtitleFilter
+            } else {
+                filter = subtitleFilter
             }
         } catch let error as VDLError {
             try? fm.removeItem(at: tempDir)
@@ -94,16 +118,29 @@ public struct FFmpegBurner: SubtitleBurner {
         }
         let copyAudio = ["-c:a", "copy"]
         let aacAudio = ["-c:a", "aac", "-b:a", "192k"]
-        let hardwareVideo = ["-c:v", "h264_videotoolbox", "-b:v", "\(bitrateK)k"]
-        let softwareVideo = ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast"]
+        // 质量优先、体积不超源：libx264 + CRF 恒定质量；-maxrate/-bufsize 给一个不低于源的
+        // 上限封顶，避免高复杂度片段码率失控。不再用 videotoolbox 定码率 ABR
+        //（实测把低码率 AV1 源抬高到 2000k+ 下限，体积涨且更糊）。
+        let softwareVideo = ["-c:v", "libx264", "-crf", "20", "-preset", "medium",
+                             "-pix_fmt", "yuv420p",
+                             "-maxrate", "\(maxrateK)k", "-bufsize", "\(maxrateK * 2)k"]
 
-        // 4. 跑 ffmpeg，stdout 的 -progress 输出换算进度
+        // 4. 跑 ffmpeg，stdout 的 -progress 输出换算进度。
+        //    onStart 登记 pid 到 control：暂停时向 ffmpeg 进程树发 SIGSTOP/SIGCONT。
         let totalSeconds = probe.duration
         func run(_ arguments: [String]) async throws -> (status: Int32, stderrTail: String) {
             try await YtDlpEngine.runStreamingProcess(
                 executable: ffmpeg,
                 arguments: arguments,
-                currentDirectory: tempDir
+                currentDirectory: tempDir,
+                onStart: { pid in
+                    if control?.isCancelled == true {
+                        // 启动瞬间已取消：立即终止进程树。
+                        TaskControlToken.signalTree(pid, SIGKILL)
+                    } else {
+                        control?.setActivePID(pid)
+                    }
+                }
             ) { line in
                 if let fraction = Self.parseProgress(line: line, totalSeconds: totalSeconds) {
                     progress(fraction)
@@ -111,19 +148,11 @@ public struct FFmpegBurner: SubtitleBurner {
             }
         }
 
-        var videoCodecArgs = hardwareVideo
+        let videoCodecArgs = softwareVideo
         var (status, stderrTail) = try await run(head + videoCodecArgs + tail(audio: copyAudio))
+        control?.setActivePID(0)
 
-        // 5. videotoolbox 编码器初始化失败 → libx264 重试一次（判据收窄到硬编码自身的报错）
-        if status != 0 {
-            let lower = stderrTail.lowercased()
-            if lower.contains("videotoolbox") || lower.contains("cannot create compression session") {
-                videoCodecArgs = softwareVideo
-                try? fm.removeItem(at: tempDir.appendingPathComponent("out.mp4"))
-                (status, stderrTail) = try await run(head + videoCodecArgs + tail(audio: copyAudio))
-            }
-        }
-        // 5b. 原音轨无法直接 copy 进 mp4 容器 → 转码 aac 重试一次
+        // 5. 原音轨无法直接 copy 进 mp4 容器 → 转码 aac 重试一次。
         if status != 0 {
             let lower = stderrTail.lowercased()
             let audioCopyFailed = lower.contains("could not find tag")
@@ -132,6 +161,7 @@ public struct FFmpegBurner: SubtitleBurner {
             if audioCopyFailed {
                 try? fm.removeItem(at: tempDir.appendingPathComponent("out.mp4"))
                 (status, stderrTail) = try await run(head + videoCodecArgs + tail(audio: aacAudio))
+                control?.setActivePID(0)
             }
         }
         guard status == 0 else {
@@ -171,6 +201,7 @@ public struct FFmpegBurner: SubtitleBurner {
     private struct ProbeResult {
         var duration: Double?
         var bitRateBPS: Double?
+        var height: Int?
     }
 
     /// 收集 ffprobe 的多行 JSON 输出（onLine 回调线程并发追加）。
@@ -207,12 +238,20 @@ public struct FFmpegBurner: SubtitleBurner {
             result.duration = double(format["duration"])
             result.bitRateBPS = double(format["bit_rate"])
         }
-        if result.bitRateBPS == nil,
-           let streams = dict["streams"] as? [[String: Any]],
+        if let streams = dict["streams"] as? [[String: Any]],
            let videoStream = streams.first(where: { ($0["codec_type"] as? String) == "video" }) {
-            result.bitRateBPS = double(videoStream["bit_rate"])
+            result.height = int(videoStream["height"])
+            if result.bitRateBPS == nil {
+                result.bitRateBPS = double(videoStream["bit_rate"])
+            }
         }
         return result
+    }
+
+    private static func int(_ any: Any?) -> Int? {
+        if let number = any as? NSNumber { return number.intValue }
+        if let string = any as? String { return Int(string) }
+        return nil
     }
 
     private static func double(_ any: Any?) -> Double? {
@@ -223,10 +262,38 @@ public struct FFmpegBurner: SubtitleBurner {
 
     // MARK: 进度与参数
 
-    /// 源码率换算 -b:v 的 k 值：缺省 5000，夹在 2000...12000。
-    private static func clampedBitrateK(_ bps: Double?) -> Int {
-        guard let bps, bps > 0 else { return 5000 }
-        return min(max(Int(bps / 1000), 2000), 12000)
+    /// 计算 -maxrate 的 k 值（CRF 编码下仅作封顶，防高复杂度片段码率失控、体积膨胀）。
+    /// 优先级：缩放后按目标高度推算 → 源整体码率 → 按源高度推算 → 缺省 6000。
+    /// 推算档位：2160p≈16000，1440p≈10000，1080p≈6000，720p≈3000，480p≈1500。
+    private static func maxrateK(
+        sourceBitRateBPS: Double?,
+        sourceHeight: Int?,
+        targetHeight: Int?
+    ) -> Int {
+        if let targetHeight {
+            // 缩放场景：按目标分辨率封顶，确保比源更小。
+            return bitrateForHeight(targetHeight)
+        }
+        if let bps = sourceBitRateBPS, bps > 0 {
+            // 不缩放：以源整体码率为上限（留 10% 余量），但不低于按高度推算的下限、不超过 20000。
+            let sourceK = Int(bps / 1000 * 1.1)
+            let floorK = sourceHeight.map(bitrateForHeight) ?? 0
+            return min(max(sourceK, floorK), 20000)
+        }
+        if let sourceHeight {
+            return bitrateForHeight(sourceHeight)
+        }
+        return 6000
+    }
+
+    private static func bitrateForHeight(_ height: Int) -> Int {
+        switch height {
+        case 1801...:  return 16000   // 4K (2160p) 及以上
+        case 1201...1800: return 10000 // 1440p
+        case 901...1200:  return 6000  // 1080p
+        case 601...900:   return 3000  // 720p
+        default:          return 1500  // 480p 及以下
+        }
     }
 
     /// 解析 -progress pipe:1 输出。out_time_ms 与 out_time_us 的值都是微秒。

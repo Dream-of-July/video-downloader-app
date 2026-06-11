@@ -16,11 +16,12 @@ let usageText = """
   vdl-cli download <url> --video-id <id> --format <formatID> \
 [--subs en,zh] [--auto-subs en] [--dest 路径]
   vdl-cli translate <srt路径> [--style bilingual|zh] [--base 服务地址] [--model 模型] [--token 凭证]
-  vdl-cli burn <视频> <srt>
+  vdl-cli burn <视频> <srt> [--max-height N | --keep-resolution]
   vdl-cli ping-llm [--base 服务地址] [--model 模型] [--token 凭证]
 
 说明：
   --base/--model/--token 缺省读 App 设置；--token 仅供本机调试，输出时只显示前 6 位。
+  burn 默认按设置里的最大高度缩放（缺省 1080p）；--max-height N 覆盖、--keep-resolution 保持源分辨率。
 """
 
 func splitLangs(_ value: String) -> [String] {
@@ -279,9 +280,33 @@ do {
         }
         let videoURL = URL(fileURLWithPath: (cliArguments[1] as NSString).expandingTildeInPath)
         let subtitleURL = URL(fileURLWithPath: (cliArguments[2] as NSString).expandingTildeInPath)
+        // 缺省读设置里的最大高度；命令行可覆盖。
+        var maxHeight: Int? = AppSettings.load().maxBurnHeight
+        var bIndex = 3
+        while bIndex < cliArguments.count {
+            let flag = cliArguments[bIndex]
+            switch flag {
+            case "--keep-resolution":
+                maxHeight = nil
+                bIndex += 1
+            case "--max-height":
+                guard bIndex + 1 < cliArguments.count, let value = Int(cliArguments[bIndex + 1]), value > 0 else {
+                    printErr("--max-height 需要一个正整数。")
+                    exit(1)
+                }
+                maxHeight = value
+                bIndex += 2
+            default:
+                printErr("未知选项：\(flag)\n" + usageText)
+                exit(1)
+            }
+        }
         let burner = makeBurner()
         let printer = PercentPrinter(label: "烧录中")
-        let outputURL = try await burner.burn(video: videoURL, subtitle: subtitleURL) {
+        let outputURL = try await burner.burn(
+            video: videoURL, subtitle: subtitleURL,
+            maxHeight: maxHeight, control: nil
+        ) {
             printer.update($0)
         }
         printer.finish()

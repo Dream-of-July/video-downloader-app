@@ -16,8 +16,12 @@ struct ContentView: View {
                 .padding(.bottom, 12)
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            queueSection
+                .frame(maxWidth: .infinity)
+                .frame(height: 260)
         }
-        .frame(minWidth: 520, minHeight: 600)
+        .frame(minWidth: 540, minHeight: 720)
         .onAppear {
             model.onAppear()
             urlFieldFocused = true
@@ -57,7 +61,6 @@ struct ContentView: View {
             parseButton
                 .disabled(
                     model.isParsing
-                    || model.isDownloadingStage
                     || model.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
             Button {
@@ -116,14 +119,6 @@ struct ContentView: View {
             choosingState(candidates)
         case .ready(let info):
             readyState(info)
-        case .downloading(let info):
-            downloadingState(info)
-        case .translating(let info):
-            pipelineState(info, label: "正在翻译字幕…")
-        case .burning(let info):
-            pipelineState(info, label: "正在烧录字幕…")
-        case .done(let info, let result):
-            doneState(info, result)
         case .failed(let message):
             failedState(message)
         }
@@ -137,6 +132,14 @@ struct ContentView: View {
             Text("粘贴链接，下载网页里的视频")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if let notice = model.enqueueNotice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 360)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -251,13 +254,13 @@ struct ContentView: View {
                 Button {
                     model.startDownload()
                 } label: {
-                    Text("下载")
+                    Text("加入队列")
                         .frame(maxWidth: .infinity)
                 }
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                Text("保存到 ~/Downloads")
+                Text("保存到 ~/Downloads · 加入后可继续粘贴下一条")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -408,188 +411,38 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func downloadingState(_ info: VideoInfo) -> some View {
-        VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    infoCard(info)
-                    progressCard
-                }
-                .frame(maxWidth: 500)
-                .padding(.horizontal, 20)
-                .padding(.bottom, 8)
-                .frame(maxWidth: .infinity)
-            }
-            Button("取消") {
-                model.cancelDownload()
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-            .padding(.vertical, 14)
-        }
-    }
+    // MARK: - 队列区
 
-    private var progressCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let p = model.progress {
-                switch p.phase {
-                case .processing:
-                    ProgressView()
-                        .progressViewStyle(.linear)
-                    Text("正在处理…")
-                        .font(.caption)
+    private var queueSection: some View {
+        Group {
+            if model.queue.items.isEmpty {
+                VStack {
+                    Spacer()
+                    Text("队列为空，解析并加入视频后在此查看进度")
+                        .font(.callout)
                         .foregroundStyle(.secondary)
-                default:
-                    if let percent = p.percent {
-                        ProgressView(value: min(max(percent, 0), 100), total: 100)
-                        HStack(spacing: 12) {
-                            Text(String(format: "%.0f%%", percent))
-                            if let speed = p.speedText {
-                                Text(speed)
-                            }
-                            Spacer()
-                            if let eta = p.etaText {
-                                Text("剩余 \(eta)")
-                            }
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    } else {
-                        ProgressView()
-                            .progressViewStyle(.linear)
-                        Text(p.phase == .preparing ? "正在准备…" : "正在下载…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    Spacer()
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ProgressView()
-                    .progressViewStyle(.linear)
-                Text("正在准备…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(cardBackground)
-    }
-
-    /// 翻译 / 烧录阶段：保留信息卡 + 流水线进度 + 取消。
-    private func pipelineState(_ info: VideoInfo, label: String) -> some View {
-        VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    infoCard(info)
-                    pipelineCard(label)
-                }
-                .frame(maxWidth: 500)
-                .padding(.horizontal, 20)
-                .padding(.bottom, 8)
-                .frame(maxWidth: .infinity)
-            }
-            Button("取消") {
-                model.cancelDownload()
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-            .padding(.vertical, 14)
-        }
-    }
-
-    private func pipelineCard(_ label: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let p = model.pipelineProgress {
-                let clamped = min(max(p, 0), 1)
-                ProgressView(value: clamped)
-                Text("\(label)（\(Int(clamped * 100))%）")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                ProgressView()
-                    .progressViewStyle(.linear)
-                Text(label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("视频较长时需要几分钟…")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(cardBackground)
-    }
-
-    private func doneState(_ info: VideoInfo, _ result: DownloadResult) -> some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 44))
-                    .foregroundStyle(.green)
-                    .padding(.top, 24)
-                Text("下载完成")
-                    .font(.title3.weight(.semibold))
-                if let notice = model.doneNotice {
-                    Text(notice)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if !result.files.isEmpty {
+                ScrollView {
                     VStack(spacing: 0) {
-                        ForEach(Array(result.files.enumerated()), id: \.element) { index, file in
-                            HStack(spacing: 10) {
-                                Image(systemName: fileIcon(for: file))
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 20)
-                                Text(file.lastPathComponent)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                Spacer(minLength: 0)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            if index < result.files.count - 1 {
-                                Divider().padding(.leading, 42)
-                            }
+                        ForEach(model.queue.items) { item in
+                            QueueItemView(
+                                item: item,
+                                onPause: { model.queue.pause(item.id) },
+                                onResume: { model.queue.resume(item.id) },
+                                onCancel: { model.queue.cancel(item.id) },
+                                onRetry: { model.queue.retry(item.id) },
+                                onRemove: { model.queue.remove(item.id) },
+                                onReveal: { model.queue.revealInFinder(item.id) }
+                            )
+                            Divider().padding(.leading, 86)
                         }
                     }
-                    .background(cardBackground)
+                    .padding(.vertical, 4)
                 }
-                HStack(spacing: 10) {
-                    Button("在访达中显示") {
-                        model.revealInFinder()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    if model.canRetryPostProcess {
-                        Button("重试字幕处理") {
-                            model.retryPostProcess()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    Button("下载新视频") {
-                        model.reset()
-                        urlFieldFocused = true
-                    }
-                    .buttonStyle(.bordered)
-                }
-                .controlSize(.large)
             }
-            .frame(maxWidth: 500)
-            .padding(.horizontal, 20)
-            .padding(.bottom, 20)
-            .frame(maxWidth: .infinity)
-        }
-    }
-
-    private func fileIcon(for file: URL) -> String {
-        switch file.pathExtension.lowercased() {
-        case "srt", "vtt", "ass":
-            return "captions.bubble"
-        case "m4a", "mp3", "opus", "aac":
-            return "music.note"
-        default:
-            return "film"
         }
     }
 

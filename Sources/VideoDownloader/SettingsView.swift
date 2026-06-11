@@ -29,6 +29,7 @@ struct SettingsView: View {
             Form {
                 translationSection
                 styleSection
+                burnQualitySection
                 loginSection
             }
             .formStyle(.grouped)
@@ -137,6 +138,20 @@ struct SettingsView: View {
                 Text("双语（原文 + 中文）").tag(SubtitleStyle.bilingual)
                 Text("仅中文").tag(SubtitleStyle.chineseOnly)
             }
+        }
+    }
+
+    // MARK: - 烧录画质
+
+    private var burnQualitySection: some View {
+        Section("烧录画质") {
+            Toggle(
+                "高清视频烧录时缩放到 1080p（更快更省空间，推荐）",
+                isOn: Binding(
+                    get: { draft.maxBurnHeight != nil },
+                    set: { draft.maxBurnHeight = $0 ? 1080 : nil }
+                )
+            )
         }
     }
 

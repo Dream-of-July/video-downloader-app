@@ -648,6 +648,9 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
         progress(DownloadProgress(phase: .preparing))
 
+        // control 已请求取消：不必启动子进程。
+        if control?.isCancelled == true { throw VDLError.cancelled }
+
         let destPrefix = destDir.path.hasSuffix("/") ? destDir.path : destDir.path + "/"
         let printedPaths = PathCollector()
         let status: Int32
@@ -655,12 +658,19 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
         do {
             (status, stderrTail) = try await Self.runStreamingProcess(
                 executable: ytdlp,
-                arguments: args
+                arguments: args,
+                onStart: { pid in
+                    // 登记主下载进程 pid：暂停时 TaskControlToken 向其进程树
+                    // （含派生的 ffmpeg）发 SIGSTOP/SIGCONT。
+                    control?.setActivePID(pid)
+                }
             ) { line in
                 Self.handleOutputLine(line, progress: progress)
                 if line.hasPrefix(destPrefix) { printedPaths.append(line) }
             }
+            control?.setActivePID(0)
         } catch {
+            control?.setActivePID(0)
             // 取消路径：进程已确认退出，先清掉残留的临时文件再上抛。
             if case VDLError.cancelled = error {
                 Self.cleanupTemporaryFiles(in: destDir, videoID: request.videoID)
@@ -851,10 +861,13 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
 
     /// 流式进程：stdout 按行回调（处理半行到达），stderr 保留尾部 16KB。
     /// internal：Burner 复用它跑 ffmpeg/ffprobe。currentDirectory 为 nil 时不改工作目录。
+    /// onStart 非空时在子进程成功启动后回调其 pid（用于登记到 TaskControlToken 实现暂停）；
+    /// 默认 nil 不改变现有调用行为。
     static func runStreamingProcess(
         executable: String,
         arguments: [String],
         currentDirectory: URL? = nil,
+        onStart: (@Sendable (Int32) -> Void)? = nil,
         onLine: @escaping @Sendable (String) -> Void
     ) async throws -> (status: Int32, stderrTail: String) {
         let state = StreamingState()
@@ -922,6 +935,7 @@ public final class YtDlpEngine: DownloadEngine, @unchecked Sendable {
                     return
                 }
                 if state.register(process) { state.cancel() }
+                else { onStart?(process.processIdentifier) }
             }
         } onCancel: {
             state.cancel()

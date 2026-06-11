@@ -72,6 +72,136 @@ func serializeSRT(_ cues: [SubtitleCue]) -> String {
         .joined(separator: "\n\n") + "\n"
 }
 
+// MARK: - 字幕清洗（去重叠 + 按句合并）
+
+/// 把 "HH:MM:SS,mmm"（或用 "." 作毫秒分隔）解析为秒。失败返回 nil。
+func srtTimeToSeconds(_ s: String) -> Double? {
+    let normalized = s.replacingOccurrences(of: ",", with: ".")
+    let parts = normalized.split(separator: ":")
+    guard parts.count == 3, let h = Int(parts[0]), let m = Int(parts[1]) else { return nil }
+    guard let sec = Double(parts[2]) else { return nil }
+    return Double(h) * 3600 + Double(m) * 60 + sec
+}
+
+/// 秒转回 "HH:MM:SS,mmm"。
+func secondsToSRTTime(_ seconds: Double) -> String {
+    let clamped = max(0, seconds)
+    let totalMS = Int((clamped * 1000).rounded())
+    let ms = totalMS % 1000
+    let totalSec = totalMS / 1000
+    let s = totalSec % 60
+    let m = (totalSec / 60) % 60
+    let h = totalSec / 3600
+    return String(format: "%02d:%02d:%02d,%03d", h, m, s, ms)
+}
+
+/// 清洗字幕：
+/// (a) 解析时间戳为秒，按 start 稳定升序；
+/// (b) 去重叠：每条 end 截断到 min(自身 end, 下一条 start)，截断后 <0.3s 则设为 start+0.3s；
+/// (c) 按句合并（仅对滚动字幕启用）：相邻碎条拼接，遇句末标点 / 累积≥6s / 累积≥84 字符断句；
+/// (d) 防误伤：合并后条数 ≥ 原条数则放弃合并，只返回去重叠结果；
+/// (e) 滚动判定：原始相邻重叠率 > 50% 才启用合并，非滚动只去重叠。
+func cleanCues(_ input: [SubtitleCue]) -> [SubtitleCue] {
+    guard !input.isEmpty else { return input }
+
+    // (a) 解析时间 + 稳定升序排序
+    struct Timed { var start: Double; var end: Double; var text: String; var order: Int }
+    var timed: [Timed] = []
+    for (i, cue) in input.enumerated() {
+        guard let start = srtTimeToSeconds(cue.start), let end = srtTimeToSeconds(cue.end) else {
+            continue
+        }
+        timed.append(Timed(start: start, end: max(end, start), text: cue.text, order: i))
+    }
+    guard !timed.isEmpty else { return input }
+    timed.sort { $0.start != $1.start ? $0.start < $1.start : $0.order < $1.order }
+
+    // (e) 滚动判定：相邻条 start < 上一条 end 的比例 > 50%
+    var overlapCount = 0
+    if timed.count >= 2 {
+        for i in 1..<timed.count where timed[i].start < timed[i - 1].end {
+            overlapCount += 1
+        }
+    }
+    let overlapRatio = timed.count >= 2 ? Double(overlapCount) / Double(timed.count - 1) : 0
+    let isRolling = overlapRatio > 0.5
+
+    // (b) 去重叠：end 截断到下一条 start，过短则给最小 0.3s
+    let minDuration = 0.3
+    for i in 0..<timed.count {
+        if i + 1 < timed.count {
+            timed[i].end = min(timed[i].end, timed[i + 1].start)
+        }
+        if timed[i].end - timed[i].start < minDuration {
+            timed[i].end = timed[i].start + minDuration
+        }
+    }
+
+    func makeCues(_ items: [Timed]) -> [SubtitleCue] {
+        items.enumerated().map { idx, t in
+            SubtitleCue(index: idx + 1, start: secondsToSRTTime(t.start),
+                        end: secondsToSRTTime(t.end), text: t.text)
+        }
+    }
+
+    // 非滚动字幕：只做去重叠，不合并
+    guard isRolling else { return makeCues(timed) }
+
+    // (c) 按句合并：把碎条文本规整空白后用空格累积，满足任一断句条件即收一条
+    func normalizeWhitespace(_ s: String) -> String {
+        s.components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+    let sentenceEnders: Set<Character> = [".", "!", "?", "。", "！", "？"]
+    let trailingAllowed: Set<Character> = ["\"", "'", "”", "’", ")", "）", "」", "』", "]"]
+    func endsSentence(_ text: String) -> Bool {
+        var chars = Array(text)
+        // 跳过尾部的引号 / 括号
+        while let last = chars.last, trailingAllowed.contains(last) || last == " " {
+            chars.removeLast()
+        }
+        guard let last = chars.last else { return false }
+        return sentenceEnders.contains(last)
+    }
+
+    var merged: [Timed] = []
+    var curText = ""
+    var curStart = 0.0
+    var curEnd = 0.0
+    var hasCurrent = false
+
+    func flush() {
+        guard hasCurrent else { return }
+        merged.append(Timed(start: curStart, end: curEnd, text: curText, order: merged.count))
+        hasCurrent = false
+        curText = ""
+    }
+
+    for t in timed {
+        let piece = normalizeWhitespace(t.text)
+        if !hasCurrent {
+            curText = piece
+            curStart = t.start
+            curEnd = t.end
+            hasCurrent = true
+        } else {
+            curText = normalizeWhitespace(curText + " " + piece)
+            curEnd = t.end
+        }
+        let longEnough = (curEnd - curStart) >= 6.0
+        let charsEnough = curText.count >= 84
+        if endsSentence(curText) || longEnough || charsEnough {
+            flush()
+        }
+    }
+    flush()
+
+    // (d) 防误伤：合并后条数没减少则放弃合并
+    guard merged.count < timed.count else { return makeCues(timed) }
+    return makeCues(merged)
+}
+
 // MARK: - Anthropic Messages API 请求
 
 /// Messages API 一次调用的结果：text 块拼接后的文本 + stop_reason。
@@ -242,16 +372,20 @@ public struct AnthropicTranslator: SubtitleTranslator {
         } catch {
             throw VDLError.translateFailed("无法读取字幕文件：\(srtFile.lastPathComponent)")
         }
-        let cues = parseSRT(raw)
-        guard !cues.isEmpty else {
+        let parsed = parseSRT(raw)
+        guard !parsed.isEmpty else {
             throw VDLError.translateFailed("字幕文件里没有可识别的字幕内容。")
         }
+        // 翻译前清洗：消除 YouTube 自动字幕的重叠滚动碎句、按句合并，减少疯狂刷新。
+        let cues = cleanCues(parsed)
 
         // 逐块顺序请求；编号用全局序号（1 起）保证块内唯一、回贴不串行。
         var output = cues
         var position = 0
         while position < cues.count {
             if Task.isCancelled { throw VDLError.cancelled }
+            // 分块前请求闸门：暂停时挂起、取消时抛出（与上面的 Task.isCancelled 并存）。
+            try await control?.gate()
             let upper = min(position + Self.chunkSize, cues.count)
             let chunk = cues[position..<upper]
             let translated = try await translateChunk(chunk, startNumber: position + 1, depth: 0)
