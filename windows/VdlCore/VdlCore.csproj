@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Vdl.Core</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <!-- P/Invoke 声明只在 Windows 运行时调用（调用点全部有 OperatingSystem.IsWindows() 守卫），
+         mac 上参与编译以保证 dotnet test 可跑。 -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="VdlCore.Tests" />
+  </ItemGroup>
+
+</Project>

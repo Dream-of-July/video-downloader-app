@@ -56,13 +56,17 @@ swift run --scratch-path ~/Library/Caches/vdl-build vdl-cli ping-llm --provider 
 
 ## Windows
 
-核心层与 `vdl-cli` 已做条件编译适配（GUI 仅 macOS），构建步骤与平台差异见 [docs/WINDOWS.md](docs/WINDOWS.md)。**尚未在真实 Windows 上验证。**
+Windows 有独立的原生实现（`windows/`：C# 核心库 + WPF 图形界面 + NSIS 安装器），
+在 macOS 上执行 `./build-windows.sh` 即可产出 `视频下载器-Windows-Setup.exe`
+（双击安装、免管理员权限、首次启动自动下载 yt-dlp/ffmpeg/deno）。
+详见 [docs/WINDOWS.md](docs/WINDOWS.md)。**GUI 尚未在真实 Windows 上运行验证。**
 
 ## 目录结构
 
 - `Sources/VDLCore/` — 核心：契约类型（`Models.swift`）、yt-dlp 封装（`Engine.swift`）、页面嗅探（`PageSniffer.swift`）
 - `Sources/VideoDownloader/` — SwiftUI 界面
 - `Sources/vdl-cli/` — 命令行测试工具
+- `windows/` — Windows 版（C# 核心库 + 单测、WPF 界面、NSIS 安装脚本）
 
 ## 已知限制
 

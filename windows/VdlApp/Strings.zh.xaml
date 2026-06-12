@@ -1,0 +1,180 @@
+<!-- 简体中文界面文案。键名与 Strings.en.xaml 必须一一对应（build 后用脚本核对）。 -->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+
+    <!-- 通用 -->
+    <sys:String x:Key="L.App.Title">视频下载器</sys:String>
+    <sys:String x:Key="L.App.FatalFmt">程序遇到意外错误，即将退出：{0}</sys:String>
+    <sys:String x:Key="L.Common.Cancel">取消</sys:String>
+    <sys:String x:Key="L.Common.Done">完成</sys:String>
+    <sys:String x:Key="L.Common.Retry">重试</sys:String>
+    <sys:String x:Key="L.Common.Close">关闭</sys:String>
+    <sys:String x:Key="L.Common.OperationFailedFmt">操作失败：{0}</sys:String>
+
+    <!-- 主窗口 -->
+    <sys:String x:Key="L.Main.Settings">设置</sys:String>
+    <sys:String x:Key="L.Main.Parse">解析</sys:String>
+    <sys:String x:Key="L.Main.Paste">粘贴</sys:String>
+    <sys:String x:Key="L.Main.PasteTooltip">粘贴剪贴板里的链接并解析</sys:String>
+    <sys:String x:Key="L.Main.UrlPlaceholder">粘贴视频链接</sys:String>
+    <sys:String x:Key="L.Idle.Headline">粘贴链接，下载网页里的视频</sys:String>
+    <sys:String x:Key="L.Idle.Sub">一次粘贴多条链接会自动逐个解析并加入队列</sys:String>
+    <sys:String x:Key="L.Loading.Default">正在解析…</sys:String>
+    <sys:String x:Key="L.Loading.BatchHint">解析完成的视频会按最高画质自动加入队列</sys:String>
+    <sys:String x:Key="L.Loading.BatchFmt">批量解析中（{0}/{1}）</sys:String>
+    <sys:String x:Key="L.Choosing.TitleFmt">这个页面里有 {0} 个视频</sys:String>
+    <sys:String x:Key="L.Error.NotAUrl">这不是一个网址。请粘贴以 http 或 https 开头的视频链接。</sys:String>
+
+    <!-- ready 页 -->
+    <sys:String x:Key="L.Ready.Enqueue">加入队列</sys:String>
+    <sys:String x:Key="L.Ready.SaveHint">保存到「下载」文件夹 · 加入后可继续粘贴下一条</sys:String>
+    <sys:String x:Key="L.Ready.BackToList">‹ 返回列表</sys:String>
+    <sys:String x:Key="L.Ready.FormatSection">格式</sys:String>
+    <sys:String x:Key="L.Ready.SubtitleSection">字幕</sys:String>
+    <sys:String x:Key="L.Ready.NoSubtitles">这个视频没有字幕</sys:String>
+    <sys:String x:Key="L.Ready.AutoTag">自动生成</sys:String>
+    <sys:String x:Key="L.Ready.ProcessSection">字幕处理</sys:String>
+    <sys:String x:Key="L.Mode.Off">不需要</sys:String>
+    <sys:String x:Key="L.Mode.SrtOnly">只生成中文字幕文件</sys:String>
+    <sys:String x:Key="L.Mode.BurnIn">翻译并烧录进视频</sys:String>
+    <sys:String x:Key="L.Mode.BurnOriginal">直接烧录字幕（不翻译）</sys:String>
+    <sys:String x:Key="L.Ready.NotConfigured">未配置翻译服务</sys:String>
+    <sys:String x:Key="L.Ready.GoSettings">去设置</sys:String>
+    <sys:String x:Key="L.Hint.SelectSubtitleFirst">先在上面勾选一条字幕</sys:String>
+    <sys:String x:Key="L.Hint.WillTranslateFmt">将翻译：{0}</sys:String>
+    <sys:String x:Key="L.Hint.WillBurnFmt">将烧录：{0}</sys:String>
+    <sys:String x:Key="L.Hint.ChineseSourceBurn">该字幕已是中文，将直接烧录（不翻译）</sys:String>
+    <sys:String x:Key="L.Hint.ChineseSourceUse">该字幕已是中文，将直接使用（不翻译）</sys:String>
+
+    <!-- 失败页 -->
+    <sys:String x:Key="L.Failed.GoLogin">去登录</sys:String>
+    <sys:String x:Key="L.Failed.Restart">重新开始</sys:String>
+    <sys:String x:Key="L.Failed.BackToList">返回列表</sys:String>
+
+    <!-- 轻提示 -->
+    <sys:String x:Key="L.Notice.EnqueuedFmt">已加入队列：{0}</sys:String>
+    <sys:String x:Key="L.Notice.Duplicate">该视频已在队列中</sys:String>
+    <sys:String x:Key="L.Notice.ConfigureTranslationFirst">请先配置翻译服务</sys:String>
+    <sys:String x:Key="L.Notice.BatchAddedFmt">已加入 {0} 个任务</sys:String>
+    <sys:String x:Key="L.Notice.BatchDupFmt">{0} 个已在队列</sys:String>
+    <sys:String x:Key="L.Notice.BatchFailedFmt">{0} 个解析失败：{1}</sys:String>
+    <sys:String x:Key="L.Notice.BatchFailedEtc"> 等</sys:String>
+    <sys:String x:Key="L.Notice.JoinSep">；</sys:String>
+    <sys:String x:Key="L.Notice.ListSep">、</sys:String>
+
+    <!-- 下载队列 -->
+    <sys:String x:Key="L.Queue.Header">下载队列</sys:String>
+    <sys:String x:Key="L.Queue.ClearFinished">清除已完成</sys:String>
+    <sys:String x:Key="L.Queue.ExpandTooltip">展开队列</sys:String>
+    <sys:String x:Key="L.Queue.CollapseTooltip">收起队列</sys:String>
+    <sys:String x:Key="L.Queue.ActiveFmt">{0} 个进行中</sys:String>
+    <sys:String x:Key="L.Queue.FinishedFmt">{0} 个已完成</sys:String>
+    <sys:String x:Key="L.Queue.AllDone">全部完成</sys:String>
+    <sys:String x:Key="L.Queue.SummarySep"> · </sys:String>
+    <sys:String x:Key="L.Row.Pause">暂停</sys:String>
+    <sys:String x:Key="L.Row.Resume">继续</sys:String>
+    <sys:String x:Key="L.Row.Cancel">取消</sys:String>
+    <sys:String x:Key="L.Row.RetrySubtitle">重试字幕处理</sys:String>
+    <sys:String x:Key="L.Row.Retry">重试</sys:String>
+    <sys:String x:Key="L.Row.Reveal">打开文件夹</sys:String>
+    <sys:String x:Key="L.Row.RevealTooltip">打开所在文件夹</sys:String>
+    <sys:String x:Key="L.Row.Remove">移除</sys:String>
+    <sys:String x:Key="L.Status.Paused">已暂停</sys:String>
+    <sys:String x:Key="L.Status.Queued">排队中…</sys:String>
+    <sys:String x:Key="L.Status.Processing">处理中…</sys:String>
+    <sys:String x:Key="L.Status.DownloadingFmt">下载中 {0}%</sys:String>
+    <sys:String x:Key="L.Status.Downloading">下载中…</sys:String>
+    <sys:String x:Key="L.Status.TranslatingFmt">翻译字幕中 {0}%</sys:String>
+    <sys:String x:Key="L.Status.Translating">翻译字幕中…</sys:String>
+    <sys:String x:Key="L.Status.BurningFmt">烧录中 {0}%</sys:String>
+    <sys:String x:Key="L.Status.Burning">烧录中…</sys:String>
+    <sys:String x:Key="L.Status.Done">已完成</sys:String>
+    <sys:String x:Key="L.Status.Cancelled">已取消</sys:String>
+    <sys:String x:Key="L.Status.FailedFmt">失败：{0}</sys:String>
+    <sys:String x:Key="L.Status.Unknown">未知错误</sys:String>
+
+    <!-- 关窗确认 -->
+    <sys:String x:Key="L.Confirm.CloseFmt">队列中还有 {0} 个任务在进行，关闭会全部中止。</sys:String>
+    <sys:String x:Key="L.Confirm.ClosePausedFmt">队列中还有 {0} 个任务（含 {1} 个已暂停），关闭会全部中止。</sys:String>
+    <sys:String x:Key="L.Confirm.AbortAndClose">全部中止并关闭</sys:String>
+    <sys:String x:Key="L.Confirm.KeepRunning">继续</sys:String>
+
+    <!-- 设置窗 -->
+    <sys:String x:Key="L.Settings.Title">设置</sys:String>
+    <sys:String x:Key="L.Settings.General">通用</sys:String>
+    <sys:String x:Key="L.Settings.Language">界面语言</sys:String>
+    <sys:String x:Key="L.Settings.LangAuto">跟随系统</sys:String>
+    <sys:String x:Key="L.Settings.LangHint">切换语言立即生效；进行中任务的状态文案在下次刷新时切换。</sys:String>
+    <sys:String x:Key="L.Settings.Translation">翻译服务</sys:String>
+    <sys:String x:Key="L.Settings.Protocol">接口协议</sys:String>
+    <sys:String x:Key="L.Settings.BaseUrl">服务地址</sys:String>
+    <sys:String x:Key="L.Settings.Credential">API 凭证</sys:String>
+    <sys:String x:Key="L.Settings.CredHelpAnthropic">公司网关按 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 填写；DeepSeek 映射也选这个协议。</sys:String>
+    <sys:String x:Key="L.Settings.CredHelpOpenAi">OpenAI 使用 Responses API。服务地址填 https://api.openai.com；凭证填 OpenAI API key，不要带 Bearer 前缀。</sys:String>
+    <sys:String x:Key="L.Settings.FetchModels">拉取模型</sys:String>
+    <sys:String x:Key="L.Settings.SelectModel">选择模型</sys:String>
+    <sys:String x:Key="L.Settings.ModelName">模型名</sys:String>
+    <sys:String x:Key="L.Settings.ModelHint">可先留空，填完地址和凭证后选择；也可手动填写。</sys:String>
+    <sys:String x:Key="L.Settings.ModelPlaceholder">请选择</sys:String>
+    <sys:String x:Key="L.Settings.Fetching">正在拉取…</sys:String>
+    <sys:String x:Key="L.Settings.FetchedFmt">已拉取 {0} 个模型</sys:String>
+    <sys:String x:Key="L.Settings.FetchFailedFmt">拉取失败：{0}</sys:String>
+    <sys:String x:Key="L.Settings.TestConnection">测试连接</sys:String>
+    <sys:String x:Key="L.Settings.Testing">正在测试…</sys:String>
+    <sys:String x:Key="L.Settings.TestOk">连接正常</sys:String>
+    <sys:String x:Key="L.Settings.TestFailedFmt">连接失败：{0}</sys:String>
+    <sys:String x:Key="L.Settings.SubtitleStyle">字幕样式</sys:String>
+    <sys:String x:Key="L.Settings.StyleLabel">中文字幕样式</sys:String>
+    <sys:String x:Key="L.Settings.StyleBilingual">双语（原文 + 中文）</sys:String>
+    <sys:String x:Key="L.Settings.StyleChineseOnly">仅中文</sys:String>
+    <sys:String x:Key="L.Settings.BurnQuality">烧录画质</sys:String>
+    <sys:String x:Key="L.Settings.Limit1080">高清视频烧录时缩放到 1080p（更快更省空间，推荐）</sys:String>
+    <sys:String x:Key="L.Settings.Limit1080Hint">关闭则按源分辨率烧录（4K 会明显更慢、文件更大）。此设置只影响烧录字幕，不影响普通下载。</sys:String>
+    <sys:String x:Key="L.Settings.Performance">性能</sys:String>
+    <sys:String x:Key="L.Settings.MaxDownloads">同时下载数</sys:String>
+    <sys:String x:Key="L.Settings.MaxBurns">同时压制数</sys:String>
+    <sys:String x:Key="L.Settings.PerfHint">超出上限的任务显示「排队中」自动等待；暂停一个任务会把空位让给下一个。压制很吃 CPU，并行过多会互相拖慢。调整立即生效。</sys:String>
+    <sys:String x:Key="L.Settings.SiteLogin">站点登录</sys:String>
+    <sys:String x:Key="L.Settings.LoginYouTube">登录 YouTube</sys:String>
+    <sys:String x:Key="L.Settings.LoginBilibili">登录哔哩哔哩</sys:String>
+    <sys:String x:Key="L.Settings.ClearLogins">清除所有登录</sys:String>
+    <sys:String x:Key="L.Settings.Cleared">已清除</sys:String>
+    <sys:String x:Key="L.Settings.LoginStatusNone">尚未登录任何站点</sys:String>
+    <sys:String x:Key="L.Settings.LoginStatusFmt">已保存登录信息（{0} 导出）</sys:String>
+    <sys:String x:Key="L.Settings.Dependencies">依赖组件</sys:String>
+    <sys:String x:Key="L.Settings.Redownload">重新下载</sys:String>
+    <sys:String x:Key="L.Settings.UpdateYtDlp">更新 yt-dlp</sys:String>
+    <sys:String x:Key="L.Settings.DepHint">站点规则频繁变化，下载经常失败时可先试试更新 yt-dlp。</sys:String>
+    <sys:String x:Key="L.Settings.Installed">已安装</sys:String>
+    <sys:String x:Key="L.Settings.Missing">缺失</sys:String>
+    <sys:String x:Key="L.Settings.DepStatusFmt">yt-dlp：{0} · ffmpeg：{1} · deno：{2}</sys:String>
+    <sys:String x:Key="L.Settings.SaveFailedFmt">设置保存失败：{0}</sys:String>
+    <sys:String x:Key="L.Settings.ClearLoginsConfirm">确定要清除所有登录吗？</sys:String>
+    <sys:String x:Key="L.Settings.ClearLoginsDetail">清除后需要重新登录才能下载会员/受限视频。</sys:String>
+    <sys:String x:Key="L.Settings.RedownloadTitle">重新下载依赖组件</sys:String>
+    <sys:String x:Key="L.Settings.RedownloadCaption">正在重新下载 yt-dlp、ffmpeg、deno 组件，请保持网络连接。</sys:String>
+    <sys:String x:Key="L.Settings.UpdateYtDlpCaption">正在下载最新版 yt-dlp，请保持网络连接。</sys:String>
+
+    <!-- 站点登录窗 -->
+    <sys:String x:Key="L.Login.Title">站点登录</sys:String>
+    <sys:String x:Key="L.Login.HeadlineFmt">登录 {0}</sys:String>
+    <sys:String x:Key="L.Login.Instruction">在下方页面完成登录，然后点右上角「完成登录」</sys:String>
+    <sys:String x:Key="L.Login.Finish">完成登录</sys:String>
+    <sys:String x:Key="L.Login.LoadingPage">正在加载登录页…</sys:String>
+    <sys:String x:Key="L.Login.PageLoadFailed">页面加载失败，请检查网络后重试</sys:String>
+    <sys:String x:Key="L.Login.NotReady">登录页尚未加载完成</sys:String>
+    <sys:String x:Key="L.Login.SaveFailedFmt">保存登录信息失败：{0}</sys:String>
+    <sys:String x:Key="L.Login.WebView2MissingTitle">缺少 WebView2 运行时</sys:String>
+    <sys:String x:Key="L.Login.WebView2MissingBody">这台电脑还没有安装 WebView2 运行时，登录窗口需要它才能显示网页。&#x0a;请前往 https://developer.microsoft.com/microsoft-edge/webview2/ 下载安装，然后重新打开登录窗口。</sys:String>
+    <sys:String x:Key="L.Login.InitFailedFmt">登录窗口初始化失败：{0}</sys:String>
+    <sys:String x:Key="L.Login.Bilibili">哔哩哔哩</sys:String>
+
+    <!-- 依赖下载窗 -->
+    <sys:String x:Key="L.Dep.FirstRunTitle">准备依赖组件</sys:String>
+    <sys:String x:Key="L.Dep.FirstRunCaption">首次启动需要下载视频处理组件（yt-dlp、ffmpeg、deno），请保持网络连接。</sys:String>
+    <sys:String x:Key="L.Dep.Checking">正在检查组件…</sys:String>
+    <sys:String x:Key="L.Dep.DownloadFailed">下载失败</sys:String>
+    <sys:String x:Key="L.Dep.CheckFailedFmt">依赖组件检查失败：{0}</sys:String>
+
+</ResourceDictionary>

@@ -1,0 +1,180 @@
+<!-- English UI strings. Keys must match Strings.zh.xaml one-to-one (checked by script after build). -->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+
+    <!-- Common -->
+    <sys:String x:Key="L.App.Title">Video Downloader</sys:String>
+    <sys:String x:Key="L.App.FatalFmt">The app hit an unexpected error and will close: {0}</sys:String>
+    <sys:String x:Key="L.Common.Cancel">Cancel</sys:String>
+    <sys:String x:Key="L.Common.Done">Done</sys:String>
+    <sys:String x:Key="L.Common.Retry">Retry</sys:String>
+    <sys:String x:Key="L.Common.Close">Close</sys:String>
+    <sys:String x:Key="L.Common.OperationFailedFmt">Operation failed: {0}</sys:String>
+
+    <!-- Main window -->
+    <sys:String x:Key="L.Main.Settings">Settings</sys:String>
+    <sys:String x:Key="L.Main.Parse">Parse</sys:String>
+    <sys:String x:Key="L.Main.Paste">Paste</sys:String>
+    <sys:String x:Key="L.Main.PasteTooltip">Paste the link from the clipboard and parse it</sys:String>
+    <sys:String x:Key="L.Main.UrlPlaceholder">Paste a video link</sys:String>
+    <sys:String x:Key="L.Idle.Headline">Paste a link to download videos from a page</sys:String>
+    <sys:String x:Key="L.Idle.Sub">Pasting multiple links parses and queues them automatically</sys:String>
+    <sys:String x:Key="L.Loading.Default">Parsing…</sys:String>
+    <sys:String x:Key="L.Loading.BatchHint">Parsed videos are queued automatically at the highest quality</sys:String>
+    <sys:String x:Key="L.Loading.BatchFmt">Parsing batch ({0}/{1})</sys:String>
+    <sys:String x:Key="L.Choosing.TitleFmt">This page contains {0} videos</sys:String>
+    <sys:String x:Key="L.Error.NotAUrl">That is not a URL. Paste a video link starting with http or https.</sys:String>
+
+    <!-- Ready page -->
+    <sys:String x:Key="L.Ready.Enqueue">Add to queue</sys:String>
+    <sys:String x:Key="L.Ready.SaveHint">Saves to your Downloads folder · paste the next link after queuing</sys:String>
+    <sys:String x:Key="L.Ready.BackToList">‹ Back to list</sys:String>
+    <sys:String x:Key="L.Ready.FormatSection">Format</sys:String>
+    <sys:String x:Key="L.Ready.SubtitleSection">Subtitles</sys:String>
+    <sys:String x:Key="L.Ready.NoSubtitles">This video has no subtitles</sys:String>
+    <sys:String x:Key="L.Ready.AutoTag">Auto</sys:String>
+    <sys:String x:Key="L.Ready.ProcessSection">Subtitle processing</sys:String>
+    <sys:String x:Key="L.Mode.Off">None</sys:String>
+    <sys:String x:Key="L.Mode.SrtOnly">Create a Chinese subtitle file only</sys:String>
+    <sys:String x:Key="L.Mode.BurnIn">Translate and burn into the video</sys:String>
+    <sys:String x:Key="L.Mode.BurnOriginal">Burn subtitle as-is (no translation)</sys:String>
+    <sys:String x:Key="L.Ready.NotConfigured">Translation service not configured</sys:String>
+    <sys:String x:Key="L.Ready.GoSettings">Open Settings</sys:String>
+    <sys:String x:Key="L.Hint.SelectSubtitleFirst">Select a subtitle above first</sys:String>
+    <sys:String x:Key="L.Hint.WillTranslateFmt">Will translate: {0}</sys:String>
+    <sys:String x:Key="L.Hint.WillBurnFmt">Will burn: {0}</sys:String>
+    <sys:String x:Key="L.Hint.ChineseSourceBurn">This subtitle is already Chinese; it will be burned directly (no translation)</sys:String>
+    <sys:String x:Key="L.Hint.ChineseSourceUse">This subtitle is already Chinese; it will be used directly (no translation)</sys:String>
+
+    <!-- Failed page -->
+    <sys:String x:Key="L.Failed.GoLogin">Sign in</sys:String>
+    <sys:String x:Key="L.Failed.Restart">Start over</sys:String>
+    <sys:String x:Key="L.Failed.BackToList">Back to list</sys:String>
+
+    <!-- Notices -->
+    <sys:String x:Key="L.Notice.EnqueuedFmt">Queued: {0}</sys:String>
+    <sys:String x:Key="L.Notice.Duplicate">This video is already in the queue</sys:String>
+    <sys:String x:Key="L.Notice.ConfigureTranslationFirst">Configure the translation service first</sys:String>
+    <sys:String x:Key="L.Notice.BatchAddedFmt">Added {0} tasks</sys:String>
+    <sys:String x:Key="L.Notice.BatchDupFmt">{0} already queued</sys:String>
+    <sys:String x:Key="L.Notice.BatchFailedFmt">{0} failed to parse: {1}</sys:String>
+    <sys:String x:Key="L.Notice.BatchFailedEtc"> etc.</sys:String>
+    <sys:String x:Key="L.Notice.JoinSep">; </sys:String>
+    <sys:String x:Key="L.Notice.ListSep">, </sys:String>
+
+    <!-- Download queue -->
+    <sys:String x:Key="L.Queue.Header">Download queue</sys:String>
+    <sys:String x:Key="L.Queue.ClearFinished">Clear finished</sys:String>
+    <sys:String x:Key="L.Queue.ExpandTooltip">Expand queue</sys:String>
+    <sys:String x:Key="L.Queue.CollapseTooltip">Collapse queue</sys:String>
+    <sys:String x:Key="L.Queue.ActiveFmt">{0} active</sys:String>
+    <sys:String x:Key="L.Queue.FinishedFmt">{0} finished</sys:String>
+    <sys:String x:Key="L.Queue.AllDone">All done</sys:String>
+    <sys:String x:Key="L.Queue.SummarySep"> · </sys:String>
+    <sys:String x:Key="L.Row.Pause">Pause</sys:String>
+    <sys:String x:Key="L.Row.Resume">Resume</sys:String>
+    <sys:String x:Key="L.Row.Cancel">Cancel</sys:String>
+    <sys:String x:Key="L.Row.RetrySubtitle">Retry subtitle steps</sys:String>
+    <sys:String x:Key="L.Row.Retry">Retry</sys:String>
+    <sys:String x:Key="L.Row.Reveal">Show in folder</sys:String>
+    <sys:String x:Key="L.Row.RevealTooltip">Open the containing folder</sys:String>
+    <sys:String x:Key="L.Row.Remove">Remove</sys:String>
+    <sys:String x:Key="L.Status.Paused">Paused</sys:String>
+    <sys:String x:Key="L.Status.Queued">Queued…</sys:String>
+    <sys:String x:Key="L.Status.Processing">Processing…</sys:String>
+    <sys:String x:Key="L.Status.DownloadingFmt">Downloading {0}%</sys:String>
+    <sys:String x:Key="L.Status.Downloading">Downloading…</sys:String>
+    <sys:String x:Key="L.Status.TranslatingFmt">Translating {0}%</sys:String>
+    <sys:String x:Key="L.Status.Translating">Translating…</sys:String>
+    <sys:String x:Key="L.Status.BurningFmt">Burning in {0}%</sys:String>
+    <sys:String x:Key="L.Status.Burning">Burning in…</sys:String>
+    <sys:String x:Key="L.Status.Done">Done</sys:String>
+    <sys:String x:Key="L.Status.Cancelled">Cancelled</sys:String>
+    <sys:String x:Key="L.Status.FailedFmt">Failed: {0}</sys:String>
+    <sys:String x:Key="L.Status.Unknown">Unknown error</sys:String>
+
+    <!-- Close confirmation -->
+    <sys:String x:Key="L.Confirm.CloseFmt">{0} tasks are still running; closing will abort them all.</sys:String>
+    <sys:String x:Key="L.Confirm.ClosePausedFmt">{0} tasks remain (including {1} paused); closing will abort them all.</sys:String>
+    <sys:String x:Key="L.Confirm.AbortAndClose">Abort all and close</sys:String>
+    <sys:String x:Key="L.Confirm.KeepRunning">Keep running</sys:String>
+
+    <!-- Settings window -->
+    <sys:String x:Key="L.Settings.Title">Settings</sys:String>
+    <sys:String x:Key="L.Settings.General">General</sys:String>
+    <sys:String x:Key="L.Settings.Language">Language</sys:String>
+    <sys:String x:Key="L.Settings.LangAuto">Follow system</sys:String>
+    <sys:String x:Key="L.Settings.LangHint">Takes effect immediately; status text of running tasks switches on their next refresh.</sys:String>
+    <sys:String x:Key="L.Settings.Translation">Translation service</sys:String>
+    <sys:String x:Key="L.Settings.Protocol">API protocol</sys:String>
+    <sys:String x:Key="L.Settings.BaseUrl">Service URL</sys:String>
+    <sys:String x:Key="L.Settings.Credential">API credential</sys:String>
+    <sys:String x:Key="L.Settings.CredHelpAnthropic">For corporate gateways, use your ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN values; DeepSeek mappings also use this protocol.</sys:String>
+    <sys:String x:Key="L.Settings.CredHelpOpenAi">Uses the OpenAI Responses API. Service URL is https://api.openai.com; enter your API key without a Bearer prefix.</sys:String>
+    <sys:String x:Key="L.Settings.FetchModels">Fetch models</sys:String>
+    <sys:String x:Key="L.Settings.SelectModel">Choose model</sys:String>
+    <sys:String x:Key="L.Settings.ModelName">Model name</sys:String>
+    <sys:String x:Key="L.Settings.ModelHint">Leave empty for now and pick one after entering the URL and credential, or type it manually.</sys:String>
+    <sys:String x:Key="L.Settings.ModelPlaceholder">Choose…</sys:String>
+    <sys:String x:Key="L.Settings.Fetching">Fetching…</sys:String>
+    <sys:String x:Key="L.Settings.FetchedFmt">Fetched {0} models</sys:String>
+    <sys:String x:Key="L.Settings.FetchFailedFmt">Fetch failed: {0}</sys:String>
+    <sys:String x:Key="L.Settings.TestConnection">Test connection</sys:String>
+    <sys:String x:Key="L.Settings.Testing">Testing…</sys:String>
+    <sys:String x:Key="L.Settings.TestOk">Connection OK</sys:String>
+    <sys:String x:Key="L.Settings.TestFailedFmt">Connection failed: {0}</sys:String>
+    <sys:String x:Key="L.Settings.SubtitleStyle">Subtitle style</sys:String>
+    <sys:String x:Key="L.Settings.StyleLabel">Chinese subtitle style</sys:String>
+    <sys:String x:Key="L.Settings.StyleBilingual">Bilingual (original + Chinese)</sys:String>
+    <sys:String x:Key="L.Settings.StyleChineseOnly">Chinese only</sys:String>
+    <sys:String x:Key="L.Settings.BurnQuality">Burn-in quality</sys:String>
+    <sys:String x:Key="L.Settings.Limit1080">Scale to 1080p when burning high-res video (faster and smaller, recommended)</sys:String>
+    <sys:String x:Key="L.Settings.Limit1080Hint">When off, burns at the source resolution (4K is much slower and larger). Only affects subtitle burn-in, not plain downloads.</sys:String>
+    <sys:String x:Key="L.Settings.Performance">Performance</sys:String>
+    <sys:String x:Key="L.Settings.MaxDownloads">Concurrent downloads</sys:String>
+    <sys:String x:Key="L.Settings.MaxBurns">Concurrent encodes</sys:String>
+    <sys:String x:Key="L.Settings.PerfHint">Tasks over the limit wait as "Queued"; pausing one yields its slot to the next. Encoding is CPU-heavy — too many in parallel slow each other down. Changes apply immediately.</sys:String>
+    <sys:String x:Key="L.Settings.SiteLogin">Site sign-in</sys:String>
+    <sys:String x:Key="L.Settings.LoginYouTube">Sign in to YouTube</sys:String>
+    <sys:String x:Key="L.Settings.LoginBilibili">Sign in to Bilibili</sys:String>
+    <sys:String x:Key="L.Settings.ClearLogins">Clear all sign-ins</sys:String>
+    <sys:String x:Key="L.Settings.Cleared">Cleared</sys:String>
+    <sys:String x:Key="L.Settings.LoginStatusNone">No site sign-ins yet</sys:String>
+    <sys:String x:Key="L.Settings.LoginStatusFmt">Sign-in saved (exported {0})</sys:String>
+    <sys:String x:Key="L.Settings.Dependencies">Components</sys:String>
+    <sys:String x:Key="L.Settings.Redownload">Re-download</sys:String>
+    <sys:String x:Key="L.Settings.UpdateYtDlp">Update yt-dlp</sys:String>
+    <sys:String x:Key="L.Settings.DepHint">Site rules change often; if downloads keep failing, try updating yt-dlp first.</sys:String>
+    <sys:String x:Key="L.Settings.Installed">Installed</sys:String>
+    <sys:String x:Key="L.Settings.Missing">Missing</sys:String>
+    <sys:String x:Key="L.Settings.DepStatusFmt">yt-dlp: {0} · ffmpeg: {1} · deno: {2}</sys:String>
+    <sys:String x:Key="L.Settings.SaveFailedFmt">Failed to save settings: {0}</sys:String>
+    <sys:String x:Key="L.Settings.ClearLoginsConfirm">Clear all sign-ins?</sys:String>
+    <sys:String x:Key="L.Settings.ClearLoginsDetail">You will need to sign in again to download member-only or restricted videos.</sys:String>
+    <sys:String x:Key="L.Settings.RedownloadTitle">Re-download components</sys:String>
+    <sys:String x:Key="L.Settings.RedownloadCaption">Re-downloading yt-dlp, ffmpeg, and deno. Keep your network connected.</sys:String>
+    <sys:String x:Key="L.Settings.UpdateYtDlpCaption">Downloading the latest yt-dlp. Keep your network connected.</sys:String>
+
+    <!-- Sign-in window -->
+    <sys:String x:Key="L.Login.Title">Site sign-in</sys:String>
+    <sys:String x:Key="L.Login.HeadlineFmt">Sign in to {0}</sys:String>
+    <sys:String x:Key="L.Login.Instruction">Sign in on the page below, then click "Finish sign-in" at the top right</sys:String>
+    <sys:String x:Key="L.Login.Finish">Finish sign-in</sys:String>
+    <sys:String x:Key="L.Login.LoadingPage">Loading the sign-in page…</sys:String>
+    <sys:String x:Key="L.Login.PageLoadFailed">Page failed to load. Check your network and retry</sys:String>
+    <sys:String x:Key="L.Login.NotReady">The sign-in page has not finished loading</sys:String>
+    <sys:String x:Key="L.Login.SaveFailedFmt">Failed to save sign-in: {0}</sys:String>
+    <sys:String x:Key="L.Login.WebView2MissingTitle">WebView2 runtime missing</sys:String>
+    <sys:String x:Key="L.Login.WebView2MissingBody">This PC does not have the WebView2 runtime, which the sign-in window needs to display web pages.&#x0a;Download it from https://developer.microsoft.com/microsoft-edge/webview2/ and reopen this window.</sys:String>
+    <sys:String x:Key="L.Login.InitFailedFmt">Sign-in window failed to initialize: {0}</sys:String>
+    <sys:String x:Key="L.Login.Bilibili">Bilibili</sys:String>
+
+    <!-- Dependency window -->
+    <sys:String x:Key="L.Dep.FirstRunTitle">Preparing components</sys:String>
+    <sys:String x:Key="L.Dep.FirstRunCaption">First launch downloads the video components (yt-dlp, ffmpeg, deno). Keep your network connected.</sys:String>
+    <sys:String x:Key="L.Dep.Checking">Checking components…</sys:String>
+    <sys:String x:Key="L.Dep.DownloadFailed">Download failed</sys:String>
+    <sys:String x:Key="L.Dep.CheckFailedFmt">Component check failed: {0}</sys:String>
+
+</ResourceDictionary>
