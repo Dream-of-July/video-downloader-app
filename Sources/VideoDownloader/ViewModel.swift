@@ -159,6 +159,27 @@ final class ViewModel: ObservableObject {
         }
     }
 
+    /// 下载目的地：会产出多个文件（字幕/译文/烧录件）时在 Downloads 下按视频标题建文件夹，
+    /// 单视频文件直接放 Downloads（避免一个视频三四个文件把下载目录搅乱）。
+    static func destinationDirectory(forTitle title: String, multiFile: Bool) -> URL {
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        guard multiFile else { return downloads }
+        return downloads.appendingPathComponent(sanitizedFolderName(title), isDirectory: true)
+    }
+
+    /// 标题转安全文件夹名：去路径分隔/控制字符、截长、去结尾点号（兼容 Windows）。
+    static func sanitizedFolderName(_ title: String) -> String {
+        var name = title
+            .components(separatedBy: CharacterSet(charactersIn: "/\\:\0").union(.newlines))
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.count > 80 {
+            name = String(name.prefix(80)).trimmingCharacters(in: .whitespaces)
+        }
+        while name.hasSuffix(".") { name.removeLast() }
+        return name.isEmpty ? "视频" : name
+    }
+
     /// 从粘贴文本里提取全部 http(s) 链接（按空白/换行分隔，容忍尾随标点），保序去重。
     static func extractURLs(from input: String) -> [String] {
         var seen = Set<String>()
@@ -236,15 +257,17 @@ final class ViewModel: ObservableObject {
                             subtitleLangs = [sub.id]
                         }
                     }
+                    let multiFile = mode != .off
+                        || !subtitleLangs.isEmpty || !autoSubtitleLangs.isEmpty
                     let request = DownloadRequest(
                         url: info.sourceURL,
                         videoID: info.videoID,
                         formatID: formatID,
                         subtitleLangs: subtitleLangs,
                         autoSubtitleLangs: autoSubtitleLangs,
-                        destinationDirectory: FileManager.default.urls(
-                            for: .downloadsDirectory, in: .userDomainMask
-                        )[0],
+                        destinationDirectory: Self.destinationDirectory(
+                            forTitle: info.title, multiFile: multiFile
+                        ),
                         preferredTitle: (candidate.kind == .pageMain || candidate.kind == .directFile)
                             ? info.title : nil
                     )
@@ -342,13 +365,15 @@ final class ViewModel: ObservableObject {
             return
         }
         let chosen = info.subtitles.filter { selectedSubtitleIDs.contains($0.id) }
+        // 会产出多个文件（字幕 / 翻译 / 烧录件）时按视频建独立文件夹；单视频直接放 Downloads。
+        let multiFile = !chosen.isEmpty || chineseMode != .off
         let request = DownloadRequest(
             url: info.sourceURL,
             videoID: info.videoID,
             formatID: formatID,
             subtitleLangs: chosen.filter { !$0.isAuto }.map(\.id),
             autoSubtitleLangs: chosen.filter { $0.isAuto }.map(\.id),
-            destinationDirectory: FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0],
+            destinationDirectory: Self.destinationDirectory(forTitle: info.title, multiFile: multiFile),
             preferredTitle: {
                 guard let kind = chosenCandidate?.kind, kind == .pageMain || kind == .directFile else { return nil }
                 return info.title
