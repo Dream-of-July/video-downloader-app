@@ -61,6 +61,9 @@ final class ViewModel: ObservableObject {
     @Published var batchStatusText: String?
     /// 触发器：自增时 ContentView 重新聚焦链接输入框（入队后方便继续粘贴）。
     @Published var requestUrlFocus = 0
+    /// 队列浮层形态：true=铺满内容区，false=缩成底部小把手。
+    /// 开始解析新链接时自动收起（让位给下载设置），入队完成/回到空闲时自动铺满。
+    @Published var queueExpanded = false
 
     /// 并发下载队列，贯穿整个 App 生命周期。
     let queue: QueueManager
@@ -112,6 +115,18 @@ final class ViewModel: ObservableObject {
         urlText = clip
     }
 
+    /// 「一键粘贴」：直接读剪贴板（绕过输入框对多行粘贴的处理差异），填入后立即解析。
+    func pasteAndParse() {
+        guard !isParsing else { return }
+        guard let clip = NSPasteboard.general.string(forType: .string)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty else {
+            enqueueNotice = "剪贴板里没有内容"
+            return
+        }
+        urlText = clip
+        parse()
+    }
+
     func parse() {
         let input = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty, !isParsing else { return }
@@ -123,13 +138,16 @@ final class ViewModel: ObservableObject {
             return
         }
 
-        guard let url = URL(string: input),
+        // 单链接也用提取结果（容忍尾随标点/前后杂字），提不出再退回原始输入
+        let target = urls.first ?? input
+        guard let url = URL(string: target),
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
               url.host != nil else {
             session += 1
             retryAction = nil
             failedNeedsLogin = nil
+            queueExpanded = false
             stage = .failed("这不是一个网址。请粘贴以 http 或 https 开头的视频链接。")
             return
         }
@@ -138,12 +156,13 @@ final class ViewModel: ObservableObject {
         retryAction = nil
         failedNeedsLogin = nil
         enqueueNotice = nil
+        queueExpanded = false
         stage = .resolving
         chosenCandidate = nil
         parseTask?.cancel()
         parseTask = Task {
             do {
-                let found = try await self.engine.resolveCandidates(for: input)
+                let found = try await self.engine.resolveCandidates(for: target)
                 guard token == self.session else { return }
                 guard !found.isEmpty else { throw VDLError.sniffFailed("") }
                 self.candidates = found
@@ -180,14 +199,20 @@ final class ViewModel: ObservableObject {
         return name.isEmpty ? "视频" : name
     }
 
-    /// 从粘贴文本里提取全部 http(s) 链接（按空白/换行分隔，容忍尾随标点），保序去重。
+    /// 从粘贴文本里提取全部 http(s) 链接，保序去重。
+    /// 按 `http(s)://` 锚点切分而非只按空白：单行输入框粘贴多行时换行可能被吞掉、
+    /// 多条链接首尾相接，按空白分隔会整段当成一条导致「只解析出一个地址」。
     static func extractURLs(from input: String) -> [String] {
         var seen = Set<String>()
         var urls: [String] = []
-        for raw in input.components(separatedBy: .whitespacesAndNewlines) {
+        // 每个字符既非空白、也不是下一条链接的开头（负向前瞻保证相接的链接被切开）
+        let pattern = #"(?i)https?://(?:(?!https?://)\S)+"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = input as NSString
+        for match in regex.matches(in: input, range: NSRange(location: 0, length: ns.length)) {
+            let raw = ns.substring(with: match.range)
             let token = raw.trimmingCharacters(in: CharacterSet(charactersIn: ",;，；、。.)）]》〉>」』\"'"))
-            guard token.lowercased().hasPrefix("http"),
-                  let url = URL(string: token),
+            guard let url = URL(string: token),
                   let scheme = url.scheme?.lowercased(),
                   scheme == "http" || scheme == "https",
                   url.host != nil,
@@ -213,6 +238,7 @@ final class ViewModel: ObservableObject {
         enqueueNotice = nil
         candidates = []
         chosenCandidate = nil
+        queueExpanded = false
         stage = .resolving
         let currentSettings = settings
         parseTask?.cancel()
@@ -297,6 +323,7 @@ final class ViewModel: ObservableObject {
                 parts.append("\(failedHosts.count) 个解析失败：\(sample)\(failedHosts.count > 2 ? " 等" : "")")
             }
             self.enqueueNotice = parts.joined(separator: "；")
+            self.queueExpanded = true
             self.requestUrlFocus += 1
         }
     }
@@ -309,6 +336,7 @@ final class ViewModel: ObservableObject {
             parseTask = nil
             batchStatusText = nil
             stage = .idle
+            queueExpanded = true
         case .analyzing:
             session += 1
             parseTask?.cancel()
@@ -395,7 +423,8 @@ final class ViewModel: ObservableObject {
         failedNeedsLogin = nil
         enqueueNotice = "已加入队列：\(info.title)"
         stage = .idle
-        // 回到 idle 后重新聚焦输入框，方便直接 Cmd+V 粘贴下一条。
+        // 入队即铺满队列（新任务落位可见），重新聚焦输入框方便直接粘贴下一条。
+        queueExpanded = true
         requestUrlFocus += 1
     }
 
@@ -437,6 +466,7 @@ final class ViewModel: ObservableObject {
         parseTask = nil
         urlText = ""
         stage = .idle
+        queueExpanded = true
         selectedFormatID = nil
         selectedSubtitleIDs = []
         chineseMode = .off

@@ -14,15 +14,15 @@ struct ContentView: View {
                 .padding(.horizontal, 20)
                 .padding(.top, 16)
                 .padding(.bottom, 12)
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            // 队列为空时折叠底部区，首屏只保留上方主引导；有任务时展开滚动区。
-            if !model.queue.items.isEmpty {
-                Divider()
-                queueSection
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 260)
+            // 内容区与队列浮层同层叠放：队列有任务且展开时铺满盖住下载设置，
+            // 收起时缩成右下角小把手（带整体进度环），点击以上移动画展开。
+            ZStack(alignment: .bottom) {
+                content
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                QueueOverlayView(queue: model.queue, expanded: $model.queueExpanded)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
         }
         .frame(minWidth: 540, minHeight: 720)
         .onAppear {
@@ -57,25 +57,53 @@ struct ContentView: View {
     // MARK: - 顶部输入区
 
     private var header: some View {
-        HStack(spacing: 8) {
-            TextField("粘贴视频链接", text: $model.urlText)
-                .textFieldStyle(.roundedBorder)
-                .focused($urlFieldFocused)
-                .onSubmit { model.parse() }
-            parseButton
-                .disabled(
-                    model.isParsing
-                    || model.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
-            Button {
-                model.showSettings = true
-            } label: {
-                Image(systemName: "gearshape")
+        VStack(alignment: .leading, spacing: 6) {
+            // 解析栏放大：输入框可多行（一次粘贴多条链接逐行可见），按钮顶部对齐
+            HStack(alignment: .top, spacing: 8) {
+                TextField("粘贴视频链接，可一次粘贴多条", text: $model.urlText, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.large)
+                    .lineLimit(1...4)
+                    .focused($urlFieldFocused)
+                    .onSubmit { model.parse() }
+                Button {
+                    model.pasteAndParse()
+                } label: {
+                    Label("粘贴", systemImage: "doc.on.clipboard")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(model.isParsing)
+                .help("一键粘贴剪贴板里的链接并解析")
+                parseButton
+                    .controlSize(.large)
+                    .disabled(
+                        model.isParsing
+                        || model.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                Button {
+                    model.showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .help("设置")
             }
-            .buttonStyle(.bordered)
-            .help("设置")
+            // 轻提示固定在解析栏下方：队列铺满时也不会被盖住
+            // （ready 页有自己的就地提示，避免双显）
+            if let notice = model.enqueueNotice, !isReadyStage {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
         }
-        .frame(maxWidth: 500)
+    }
+
+    private var isReadyStage: Bool {
+        if case .ready = model.stage { return true }
+        return false
     }
 
     /// 解析按钮：仅在 idle / failed 阶段作为主按钮，其余阶段降级为次按钮。
@@ -139,14 +167,6 @@ struct ContentView: View {
             Text("一次粘贴多条链接会自动逐个解析并加入队列")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
-            if let notice = model.enqueueNotice {
-                Text(notice)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: 360)
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -436,15 +456,6 @@ struct ContentView: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    // MARK: - 队列区
-
-    private var queueSection: some View {
-        // 独立子视图直接观察 QueueManager：进度/状态变更只重绘队列区，
-        // 不经 ViewModel（它从不转发 queue.objectWillChange——以前这正是
-        // 「进度条冻结、按钮不翻转」的根因）。
-        QueueSectionView(queue: model.queue)
     }
 
     private func failedState(_ message: String) -> some View {
