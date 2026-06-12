@@ -53,6 +53,10 @@ final class ViewModel: ObservableObject {
     @Published var loginSite: String?
     /// 失败原因是需要登录时记录站点，failed 页据此把主按钮换成「去登录」
     @Published var failedNeedsLogin: String?
+    /// 失败原因是缺依赖（yt-dlp/ffmpeg 找不到）时，failed 页给「一键安装依赖」入口
+    @Published var failedNeedsDependency = false
+    /// 一键安装依赖的弹层
+    @Published var showDependencySetup = false
     /// 设置窗里的提示（保存失败 / 请先配置翻译服务）
     @Published var settingsNotice: String?
     /// 入队成功后的一行轻提示（如「已加入队列」）
@@ -147,6 +151,7 @@ final class ViewModel: ObservableObject {
             session += 1
             retryAction = nil
             failedNeedsLogin = nil
+            failedNeedsDependency = false
             queueExpanded = false
             stage = .failed("这不是一个网址。请粘贴以 http 或 https 开头的视频链接。")
             return
@@ -155,6 +160,7 @@ final class ViewModel: ObservableObject {
         let token = session
         retryAction = nil
         failedNeedsLogin = nil
+        failedNeedsDependency = false
         enqueueNotice = nil
         queueExpanded = false
         stage = .resolving
@@ -235,6 +241,7 @@ final class ViewModel: ObservableObject {
         let token = session
         retryAction = nil
         failedNeedsLogin = nil
+        failedNeedsDependency = false
         enqueueNotice = nil
         candidates = []
         chosenCandidate = nil
@@ -352,6 +359,7 @@ final class ViewModel: ObservableObject {
         let token = session
         retryAction = nil
         failedNeedsLogin = nil
+        failedNeedsDependency = false
         chosenCandidate = candidate
         stage = .analyzing
         parseTask?.cancel()
@@ -421,6 +429,7 @@ final class ViewModel: ObservableObject {
         chosenCandidate = nil
         retryAction = nil
         failedNeedsLogin = nil
+        failedNeedsDependency = false
         enqueueNotice = "已加入队列：\(info.title)"
         stage = .idle
         // 入队即铺满队列（新任务落位可见），重新聚焦输入框方便直接粘贴下一条。
@@ -448,6 +457,7 @@ final class ViewModel: ObservableObject {
         parseTask = nil
         retryAction = nil
         failedNeedsLogin = nil
+        failedNeedsDependency = false
         stage = .choosing(candidates)
     }
 
@@ -474,6 +484,7 @@ final class ViewModel: ObservableObject {
         chosenCandidate = nil
         retryAction = nil
         failedNeedsLogin = nil
+        failedNeedsDependency = false
         enqueueNotice = nil
     }
 
@@ -532,6 +543,12 @@ final class ViewModel: ObservableObject {
             failedNeedsLogin = site
         } else {
             failedNeedsLogin = nil
+            failedNeedsDependency = false
+        }
+        if case VDLError.binaryNotFound = error {
+            failedNeedsDependency = true
+        } else {
+            failedNeedsDependency = false
         }
         stage = .failed(error.localizedDescription)
     }

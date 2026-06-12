@@ -36,6 +36,9 @@ struct ContentView: View {
         .sheet(isPresented: $model.showSettings, onDismiss: { model.consumePendingLogin() }) {
             SettingsView(model: model)
         }
+        .sheet(isPresented: $model.showDependencySetup) {
+            DependencySetupSheet(model: model)
+        }
         .sheet(isPresented: loginSheetBinding) {
             if let site = model.loginSite {
                 LoginSheet(
@@ -484,7 +487,16 @@ struct ContentView: View {
                         .frame(maxWidth: 420)
                 }
                 HStack(spacing: 10) {
-                    if model.failedNeedsLogin != nil {
+                    if model.failedNeedsDependency {
+                        Button("一键安装依赖") {
+                            model.showDependencySetup = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("重试") {
+                            model.retry()
+                        }
+                        .buttonStyle(.bordered)
+                    } else if model.failedNeedsLogin != nil {
                         Button("去登录") {
                             model.openLoginForFailure()
                         }

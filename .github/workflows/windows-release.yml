@@ -6,11 +6,11 @@ on:
       tag:
         description: Release tag to upload to
         required: true
-        default: v0.1.0
+        default: v0.2.0
       version:
         description: App version
         required: true
-        default: 0.1.0
+        default: 0.2.0
 
 permissions:
   contents: write
