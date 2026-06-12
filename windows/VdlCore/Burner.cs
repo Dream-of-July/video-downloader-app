@@ -364,10 +364,9 @@ public sealed class FFmpegBurner : ISubtitleBurner
 
     /// <summary>
     /// 按视频长宽比推导的 ASS 布局参数。
-    /// 字号历来按「高度的固定比例」调校（横屏 16:9 下 15/288≈5.2% 视频高），
-    /// 竖屏时宽度变窄、同比例字号一行只装得下十来个字还会顶边。
-    /// 竖屏改按 sqrt(aspect / (16/9)) 缩小字号——高度占比与每行字数的折中
-    /// （纯按宽度缩会太小，不缩会溢出），9:16 时中文一行约 19 字。
+    /// 字号仍按「高度的固定比例」调校（横屏 16:9 下 15/288≈5.2% 视频高），
+    /// 但阅读宽度不能跟着视频宽度无限增长：16:9 下约 26 个中文字符一行，
+    /// 竖屏维持约 19 个字符，超宽屏最多约 30 个字符。
     /// </summary>
     internal readonly struct AssLayout
     {
@@ -396,11 +395,32 @@ public sealed class FFmpegBurner : ISubtitleBurner
                 ChineseSize = Math.Max(8, (int)Math.Round(ChineseFontSize * scale, MidpointRounding.AwayFromZero));
                 OriginalSize = Math.Max(6, (int)Math.Round(OriginalFontSize * scale, MidpointRounding.AwayFromZero));
             }
-            MarginH = Math.Max(5, (int)Math.Round(PlayResX * 0.03, MidpointRounding.AwayFromZero));
+            var targetCapacity = TargetCjkCapacity(safeAspect);
+            var baseMargin = Math.Max(5, (int)Math.Round(PlayResX * 0.03, MidpointRounding.AwayFromZero));
+            var readableMargin = (int)Math.Ceiling((PlayResX - targetCapacity * ChineseSize) / 2.0);
+            MarginH = Math.Max(baseMargin, readableMargin);
             // 中文无空格，部分 libass 构建只在空格处断行，长行会横向溢出；
             // 一律自己按容量预换行（同时把行切得均衡，避免「一长一短」的难看断行）。
-            var capacity = (PlayResX - MarginH * 2) / Math.Max(ChineseSize, 1);
+            var availableCapacity = (PlayResX - MarginH * 2) / Math.Max(ChineseSize, 1);
+            var capacity = Math.Min(availableCapacity, targetCapacity);
             CjkWrapCapacity = capacity >= 6 ? capacity : null;
+        }
+
+        private static int TargetCjkCapacity(double aspect)
+        {
+            const double wide = 16.0 / 9.0;
+            if (aspect < 1)
+            {
+                var t = Math.Clamp((aspect - 9.0 / 16.0) / (1.0 - 9.0 / 16.0), 0, 1);
+                return (int)Math.Round(19.0 + t * 3.0, MidpointRounding.AwayFromZero);
+            }
+            if (aspect <= wide)
+            {
+                var t = Math.Clamp((aspect - 1.0) / (wide - 1.0), 0, 1);
+                return (int)Math.Round(22.0 + t * 4.0, MidpointRounding.AwayFromZero);
+            }
+            var ultraWideT = Math.Clamp((aspect - wide) / (4.0 - wide), 0, 1);
+            return (int)Math.Round(26.0 + ultraWideT * 4.0, MidpointRounding.AwayFromZero);
         }
     }
 

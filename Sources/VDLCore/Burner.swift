@@ -33,7 +33,7 @@ public struct FFmpegBurner: SubtitleBurner {
     }
     #else
     // 烧录需要带 libass 的 ffmpeg（subtitles 滤镜）。Homebrew 镜像的 ffmpeg 可能是
-    // 无 libass 的精简版，因此优先找 keg-only 的 ffmpeg-full。
+    // 无 libass 的精简版，因此优先找 keg-only 的 ffmpeg-full，并在选择时验证能力。
     private static let searchPaths = [
         "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
         "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
@@ -43,20 +43,56 @@ public struct FFmpegBurner: SubtitleBurner {
 
     private static func locate(_ name: String) -> String? {
         if name == "ffmpeg" {
-            if let custom = ProcessInfo.processInfo.environment["VDL_BURN_FFMPEG_PATH"],
-               !custom.isEmpty, FileManager.default.isExecutableFile(atPath: custom) {
-                return custom
-            }
-            for path in searchPaths where FileManager.default.isExecutableFile(atPath: path) {
-                return path
-            }
-            return nil
+            return locateSubtitleRendererFFmpeg()
         }
         for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
             let path = dir + "/" + name
             if FileManager.default.isExecutableFile(atPath: path) { return path }
         }
         return nil
+    }
+
+    internal static func locateSubtitleRendererFFmpeg(
+        candidates: [String] = searchPaths,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fileIsExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) },
+        supportsSubtitleRendering: (String) -> Bool = ffmpegSupportsSubtitleRendering
+    ) -> String? {
+        if let custom = environment["VDL_BURN_FFMPEG_PATH"],
+           !custom.isEmpty, fileIsExecutable(custom), supportsSubtitleRendering(custom) {
+            return custom
+        }
+        for path in candidates where fileIsExecutable(path) && supportsSubtitleRendering(path) {
+            return path
+        }
+        return nil
+    }
+
+    internal static func filterListHasSubtitleRenderer(_ text: String) -> Bool {
+        text.split(whereSeparator: \.isNewline).contains { line in
+            line.range(
+                of: #"^\s*[TSC\.]+\s+subtitles\s"#,
+                options: .regularExpression
+            ) != nil
+        }
+    }
+
+    private static func ffmpegSupportsSubtitleRendering(_ path: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["-hide_banner", "-filters"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return false }
+        return filterListHasSubtitleRenderer(String(decoding: data, as: UTF8.self))
     }
     #endif
 
@@ -74,10 +110,13 @@ public struct FFmpegBurner: SubtitleBurner {
         subtitle: URL,
         maxHeight: Int?,
         control: TaskControlToken?,
+        outputTag: String? = nil,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
         guard let ffmpeg = Self.locate("ffmpeg") else {
-            throw VDLError.binaryNotFound("ffmpeg")
+            throw VDLError.burnFailed(
+                "当前 ffmpeg 不带字幕渲染组件（libass）。请安装完整版后重试：brew install ffmpeg-full"
+            )
         }
         if control?.isCancelled == true { throw VDLError.cancelled }
 
@@ -242,10 +281,11 @@ public struct FFmpegBurner: SubtitleBurner {
         // 6. 移到视频同目录："<原名>（中文字幕）.mp4"，重名时加 " 2"、" 3"…
         let stem = video.deletingPathExtension().lastPathComponent
         let directory = video.deletingLastPathComponent()
-        var destination = directory.appendingPathComponent("\(stem)（中文字幕）.mp4")
+        let tag = outputTag ?? "（中文字幕）"
+        var destination = directory.appendingPathComponent("\(stem)\(tag).mp4")
         var serial = 2
         while fm.fileExists(atPath: destination.path) {
-            destination = directory.appendingPathComponent("\(stem)（中文字幕） \(serial).mp4")
+            destination = directory.appendingPathComponent("\(stem)\(tag) \(serial).mp4")
             serial += 1
         }
         do {
@@ -383,10 +423,9 @@ public struct FFmpegBurner: SubtitleBurner {
     private static let originalFontSize = 11
 
     /// 按视频长宽比推导的 ASS 布局参数。
-    /// 字号历来按「高度的固定比例」调校（横屏 16:9 下 15/288≈5.2% 视频高），
-    /// 竖屏时宽度变窄、同比例字号一行只装得下十来个字还会顶边。
-    /// 竖屏改按 sqrt(aspect / (16/9)) 缩小字号——高度占比与每行字数的折中
-    ///（纯按宽度缩会太小，不缩会溢出），9:16 时中文一行约 19 字。
+    /// 字号仍按「高度的固定比例」调校（横屏 16:9 下 15/288≈5.2% 视频高），
+    /// 但阅读宽度不能跟着视频宽度无限增长：16:9 下约 26 个中文字符一行，
+    /// 竖屏维持约 19 个字符，超宽屏最多约 30 个字符。
     struct ASSLayout: Equatable {
         let playResX: Int
         let playResY = 288
@@ -409,15 +448,33 @@ public struct FFmpegBurner: SubtitleBurner {
                 chineseSize = max(8, Int((Double(Self.baseChinese) * scale).rounded()))
                 originalSize = max(6, Int((Double(Self.baseOriginal) * scale).rounded()))
             }
-            marginH = max(5, Int((Double(playResX) * 0.03).rounded()))
+            let targetCapacity = Self.targetCJKCapacity(for: safeAspect)
+            let baseMargin = max(5, Int((Double(playResX) * 0.03).rounded()))
+            let readableMargin = Int(((Double(playResX) - Double(targetCapacity * chineseSize)) / 2).rounded(.up))
+            marginH = max(baseMargin, readableMargin)
             // 中文无空格，部分 libass 构建只在空格处断行，长行会横向溢出；
             // 一律自己按容量预换行（同时把行切得均衡，避免「一长一短」的难看断行）。
-            let capacity = (playResX - marginH * 2) / max(chineseSize, 1)
+            let availableCapacity = (playResX - marginH * 2) / max(chineseSize, 1)
+            let capacity = min(availableCapacity, targetCapacity)
             cjkWrapCapacity = capacity >= 6 ? capacity : nil
         }
 
         private static let baseChinese = FFmpegBurner.chineseFontSize
         private static let baseOriginal = FFmpegBurner.originalFontSize
+
+        private static func targetCJKCapacity(for aspect: Double) -> Int {
+            let wide = 16.0 / 9.0
+            if aspect < 1 {
+                let t = max(0, min(1, (aspect - 9.0 / 16.0) / (1.0 - 9.0 / 16.0)))
+                return Int((19.0 + t * 3.0).rounded())
+            }
+            if aspect <= wide {
+                let t = max(0, min(1, (aspect - 1.0) / (wide - 1.0)))
+                return Int((22.0 + t * 4.0).rounded())
+            }
+            let t = max(0, min(1, (aspect - wide) / (4.0 - wide)))
+            return Int((26.0 + t * 4.0).rounded())
+        }
     }
 
     /// 把 SRT 字幕转成 ASS：双语条目（首行含中日韩文字、其余行不含）首行用正常字号，

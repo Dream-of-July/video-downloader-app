@@ -318,7 +318,50 @@ final class QueueManager: ObservableObject {
         // 找翻译源字幕；没有就完成并提示已跳过
         let preferredLang = current.request.subtitleLangs.first ?? current.request.autoSubtitleLangs.first
         guard let srtFile = Self.pickSourceSubtitle(from: downloadFiles, preferredLang: preferredLang) else {
-            finishDone(id, generation: generation, files: downloadFiles, statusText: "没有字幕文件，已跳过翻译")
+            finishDone(
+                id, generation: generation, files: downloadFiles,
+                statusText: mode == .burnOriginal ? "没有字幕文件，已跳过烧录" : "没有字幕文件，已跳过翻译"
+            )
+            return
+        }
+
+        // 直接烧录模式：跳过翻译，把所选源字幕原样压进视频（无论语言、无需配置翻译服务）。
+        if mode == .burnOriginal {
+            guard let video = downloadFiles.first(where: {
+                Self.videoExtensions.contains($0.pathExtension.lowercased())
+            }) else {
+                finishDone(id, generation: generation, files: downloadFiles, statusText: "没有找到视频文件，已跳过烧录")
+                return
+            }
+            do {
+                try await acquireSlot(burnPool, id: id, generation: generation, control: control, waitingText: "排队中：等待压制空位")
+                defer { releaseSlot(id, generation: generation) }
+                update(id, generation: generation) { $0.stage = .burning; $0.progress = nil; $0.statusText = "直接烧录字幕（不翻译）" }
+                let burner = makeBurner()
+                let burned = try await burner.burn(
+                    video: video,
+                    subtitle: srtFile,
+                    maxHeight: settings.maxBurnHeight,
+                    control: control,
+                    outputTag: "（字幕版）"
+                ) { [weak self] p in
+                    Task { @MainActor in
+                        self?.update(id, generation: generation) {
+                            guard $0.stage == .burning else { return }
+                            $0.progress = p
+                        }
+                    }
+                }
+                guard item(id)?.generation == generation else { return }
+                update(id, generation: generation) {
+                    $0.resultFiles.removeAll { $0 == burned }
+                    $0.resultFiles.insert(burned, at: 0)
+                }
+                finishDone(id, generation: generation, files: item(id)?.resultFiles ?? downloadFiles, statusText: "已烧录字幕（未翻译）")
+            } catch {
+                guard item(id)?.generation == generation else { return }
+                settlePartial(id, generation: generation, files: item(id)?.resultFiles ?? downloadFiles, error: error, phase: "烧录")
+            }
             return
         }
 

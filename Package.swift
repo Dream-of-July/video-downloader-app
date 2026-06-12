@@ -11,6 +11,11 @@ var packageTargets: [Target] = [
         dependencies: ["VDLCore"],
         path: "Sources/vdl-cli"
     ),
+    .testTarget(
+        name: "VDLCoreTests",
+        dependencies: ["VDLCore"],
+        path: "Tests/VDLCoreTests"
+    ),
 ]
 
 #if !os(Windows)

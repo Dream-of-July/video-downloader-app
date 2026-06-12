@@ -32,10 +32,12 @@ struct SettingsView: View {
     @State private var showClearConfirm = false
     /// cookies.txt 的修改日期；nil 表示尚未登录任何站点
     @State private var cookieDate: Date?
+    @State private var dependencyComponents: [DependencySetup.Component] = DependencySetup.check()
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
+                dependencySection
                 translationSection
                 styleSection
                 burnQualitySection
@@ -60,6 +62,7 @@ struct SettingsView: View {
         .onAppear {
             draft = model.settings
             refreshLoginStatus()
+            refreshDependencies()
         }
         .onDisappear {
             testTask?.cancel()
@@ -67,6 +70,49 @@ struct SettingsView: View {
             // 未点「完成」时回滚为磁盘值；已保存时 reload 等价于当前值，无副作用。
             model.settings = AppSettings.load()
         }
+    }
+
+    // MARK: - 依赖组件
+
+    private var dependencySection: some View {
+        Section("依赖组件") {
+            ForEach(dependencyComponents) { component in
+                HStack(spacing: 8) {
+                    Image(systemName: component.isInstalled ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(component.isInstalled ? .green : .orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(component.id)
+                            .font(.body.monospaced())
+                        Text(component.purpose)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(component.isInstalled ? "已就绪" : "待安装")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button("重新检测") {
+                    refreshDependencies()
+                }
+                .buttonStyle(.bordered)
+                Button(DependencySetup.needsSetup(dependencyComponents) ? "一键配置缺失组件" : "打开配置") {
+                    model.requestDependencySetup()
+                }
+                .buttonStyle(.borderedProminent)
+                Spacer()
+                Text(DependencySetup.needsSetup(dependencyComponents) ? "有组件未就绪" : "全部就绪")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func refreshDependencies() {
+        dependencyComponents = DependencySetup.check()
     }
 
     // MARK: - 翻译服务

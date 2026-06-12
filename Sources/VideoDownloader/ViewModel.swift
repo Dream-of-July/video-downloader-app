@@ -5,18 +5,28 @@ import Foundation
 import VDLCore
 #endif
 
-/// 中文字幕处理方式（ready 页「中文字幕」分组的三个选项）
+/// 字幕处理方式（ready 页「字幕处理」分组的选项）
 enum ChineseSubtitleMode: String, CaseIterable {
     case off
     case srtOnly
     case burnIn
+    case burnOriginal
 
     var label: String {
         switch self {
         case .off: return "不需要"
         case .srtOnly: return "只生成中文字幕文件"
         case .burnIn: return "翻译并烧录进视频"
+        case .burnOriginal: return "直接烧录字幕（不翻译）"
         }
+    }
+
+    var requiresTranslation: Bool {
+        self == .srtOnly || self == .burnIn
+    }
+
+    var requiresBurner: Bool {
+        self == .burnIn || self == .burnOriginal
     }
 }
 
@@ -79,6 +89,10 @@ final class ViewModel: ObservableObject {
     private var retryAction: (@MainActor () -> Void)?
     /// 设置窗里点了「登录 ××」：先收起设置 sheet，再由其 onDismiss 弹出登录窗
     private var pendingLoginSite: String?
+    /// 设置窗里点了「配置依赖」：先收起设置 sheet，再由其 onDismiss 弹出依赖配置窗
+    private var pendingDependencySetup = false
+    /// 首次进入主界面时只做一次依赖体检，避免 sheet 被反复弹起。
+    private var didRunStartupDependencyCheck = false
     /// 代际令牌：reset / 取消后，旧解析任务的回调全部作废
     private var session = 0
 
@@ -102,6 +116,7 @@ final class ViewModel: ObservableObject {
 
     func onAppear() {
         prefillFromClipboardIfAppropriate()
+        showDependencySetupIfNeededOnStartup()
     }
 
     /// 视图出现或 App 激活时：处于可输入阶段且输入框为空，用剪贴板里的链接预填（不自动解析）。
@@ -232,11 +247,12 @@ final class ViewModel: ObservableObject {
     /// 当前已选「中文字幕」模式会沿用，并自动挑一条字幕作翻译源（真实字幕优先）。
     private func processBatch(_ urls: [String]) {
         let mode = chineseMode
-        if mode != .off, !settings.isTranslationConfigured {
+        if mode.requiresTranslation, !settings.isTranslationConfigured {
             settingsNotice = "请先配置翻译服务"
             showSettings = true
             return
         }
+        guard dependenciesReady(for: mode) else { return }
         session += 1
         let token = session
         retryAction = nil
@@ -389,11 +405,12 @@ final class ViewModel: ObservableObject {
     /// ready 页「加入队列」：构造 DownloadRequest 入队，然后清空回可输入态以便继续添加下一条。
     func startDownload() {
         guard case .ready(let info) = stage else { return }
-        if chineseMode != .off, !settings.isTranslationConfigured {
+        if chineseMode.requiresTranslation, !settings.isTranslationConfigured {
             settingsNotice = "请先配置翻译服务"
             showSettings = true
             return
         }
+        guard dependenciesReady(for: chineseMode) else { return }
         guard let formatID = selectedFormatID ?? info.formats.first?.id else { return }
         // 去重：队列里已有同源未完成任务时不再起新任务，只给一行提示。
         if queue.hasOpenDuplicate(videoID: info.videoID, sourceURL: info.sourceURL, formatID: formatID) {
@@ -488,6 +505,24 @@ final class ViewModel: ObservableObject {
         enqueueNotice = nil
     }
 
+    private func dependenciesReady(for mode: ChineseSubtitleMode) -> Bool {
+        guard mode.requiresBurner else { return true }
+        let missing = DependencySetup.missing
+        guard missing.contains(where: { $0.id == "ffmpeg" }) else { return true }
+        settingsNotice = "请先安装支持字幕烧录的完整版 ffmpeg"
+        showDependencySetup = true
+        return false
+    }
+
+    private func showDependencySetupIfNeededOnStartup() {
+        guard !didRunStartupDependencyCheck else { return }
+        didRunStartupDependencyCheck = true
+        let components = DependencySetup.check()
+        guard DependencySetup.needsSetup(components) else { return }
+        settingsNotice = "请先完成依赖组件配置"
+        showDependencySetup = true
+    }
+
     // MARK: - 设置与站点登录
 
     /// 保存设置；失败时把原因写进 settingsNotice。
@@ -510,11 +545,42 @@ final class ViewModel: ObservableObject {
         showSettings = false
     }
 
-    /// 设置 sheet 的 onDismiss 调用：若有待弹出的登录站点则弹出登录窗。
-    func consumePendingLogin() {
+    /// 设置窗里点「配置依赖」：先收起设置窗，再弹依赖配置窗，避免 sheet 叠 sheet。
+    func requestDependencySetup() {
+        pendingDependencySetup = true
+        showSettings = false
+    }
+
+    /// 设置 sheet 的 onDismiss 调用：若有待弹出的二级流程则继续弹出。
+    func consumePendingSettingsActions() {
+        consumePendingLogin()
+        consumePendingDependencySetup()
+    }
+
+    private func consumePendingLogin() {
         guard let site = pendingLoginSite else { return }
         pendingLoginSite = nil
         loginSite = site
+    }
+
+    private func consumePendingDependencySetup() {
+        guard pendingDependencySetup else { return }
+        pendingDependencySetup = false
+        showDependencySetup = true
+    }
+
+    func closeDependencySetup() {
+        showDependencySetup = false
+    }
+
+    func completeDependencySetup() {
+        showDependencySetup = false
+        settingsNotice = nil
+        let shouldRetry = failedNeedsDependency
+        failedNeedsDependency = false
+        if shouldRetry {
+            retry()
+        }
     }
 
     /// failed 页点「去登录」。

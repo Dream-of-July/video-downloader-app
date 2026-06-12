@@ -250,6 +250,7 @@ public extension SubtitleTranslator {
 /// 用 `makeBurner()` 获取实例。
 public protocol SubtitleBurner: Sendable {
     /// 把 subtitle 烧录进 video，输出 "<原名>（中文字幕).mp4" 风格的新文件（不覆盖原片）；
+    /// outputTag 非空时自定义文件名标签，例如直压原字幕模式用 "（字幕版）"。
     /// maxHeight 非空且源更高时缩放到该高度；progress 为 0...1。
     /// control 非空时支持暂停/取消（向 ffmpeg 进程树发 SIGSTOP/SIGCONT、取消时终止）。
     /// 失败抛 VDLError.burnFailed。
@@ -258,6 +259,7 @@ public protocol SubtitleBurner: Sendable {
         subtitle: URL,
         maxHeight: Int?,
         control: TaskControlToken?,
+        outputTag: String?,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL
 }
@@ -266,9 +268,27 @@ public extension SubtitleBurner {
     func burn(
         video: URL,
         subtitle: URL,
+        maxHeight: Int?,
+        control: TaskControlToken?,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
-        try await burn(video: video, subtitle: subtitle, maxHeight: nil, control: nil, progress: progress)
+        try await burn(
+            video: video, subtitle: subtitle,
+            maxHeight: maxHeight, control: control, outputTag: nil,
+            progress: progress
+        )
+    }
+
+    func burn(
+        video: URL,
+        subtitle: URL,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> URL {
+        try await burn(
+            video: video, subtitle: subtitle,
+            maxHeight: nil, control: nil, outputTag: nil,
+            progress: progress
+        )
     }
 }
 

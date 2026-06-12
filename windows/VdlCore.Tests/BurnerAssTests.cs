@@ -14,7 +14,7 @@ public class AssGenerationTests
         Assert.Contains("PlayResX: 512", ass);
         Assert.Contains("PlayResY: 288", ass);
         Assert.Contains($"Style: ZH,{FFmpegBurner.WindowsFontName},15,", ass);
-        Assert.Contains(",2,15,15,20,1", ass);  // Alignment 2 + MarginL/R 15 + MarginV 20
+        Assert.Contains(",2,61,61,20,1", ass);  // Alignment 2 + readable MarginL/R + MarginV 20
     }
 
     /// <summary>竖屏 9:16：坐标系收窄、字号边距整体缩小，双语小字号同步用 6。</summary>
@@ -134,8 +134,22 @@ public class AssLayoutTests
         Assert.Equal(512, layout.PlayResX);
         Assert.Equal(15, layout.ChineseSize);
         Assert.Equal(11, layout.OriginalSize);
-        Assert.Equal(15, layout.MarginH);
-        Assert.Equal(32, layout.CjkWrapCapacity);
+        Assert.Equal(61, layout.MarginH);
+        Assert.Equal(26, layout.CjkWrapCapacity);
+    }
+
+    [Fact]
+    public void Landscape169_LongChineseLine_PreWrappedForReadableWidth()
+    {
+        var ass = FFmpegBurner.MakeAss([
+            new SubtitleCue(
+                1,
+                "00:00:01,000",
+                "00:00:02,500",
+                "今天，我会介绍如何使用Xcode中的一些强大新工具，在早期探索应用设计时快速尝试不同的界面方向。")
+        ]);
+
+        Assert.Contains(@"今天，我会介绍如何使用Xcode中的一些强大新工具，\N在早期探索应用设计时快速尝试不同的界面方向。", ass);
     }
 
     /// <summary>非法长宽比（0/NaN）回退 16:9；超宽封顶 4.0。</summary>
@@ -147,12 +161,14 @@ public class AssLayoutTests
             var layout = new FFmpegBurner.AssLayout(aspect);
             Assert.Equal(512, layout.PlayResX);
             Assert.Equal(15, layout.ChineseSize);
-            Assert.Equal(15, layout.MarginH);
+            Assert.Equal(61, layout.MarginH);
+            Assert.Equal(26, layout.CjkWrapCapacity);
         }
         var ultraWide = new FFmpegBurner.AssLayout(10.0);
         Assert.Equal(1152, ultraWide.PlayResX);   // 288 × 4.0（封顶）
         Assert.Equal(15, ultraWide.ChineseSize);  // 横屏不缩字号
-        Assert.Equal(35, ultraWide.MarginH);
+        Assert.Equal(351, ultraWide.MarginH);
+        Assert.Equal(30, ultraWide.CjkWrapCapacity);
     }
 }
 

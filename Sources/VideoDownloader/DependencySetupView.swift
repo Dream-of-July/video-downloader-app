@@ -4,7 +4,7 @@ import SwiftUI
 import VDLCore
 #endif
 
-/// 一键安装依赖：体检 → `brew install` 缺失项（流式日志）→ 完成后回到解析重试。
+/// 一键安装依赖：体检 → `brew install` 缺失项（流式日志）→ 完成后回到业务流程。
 /// Homebrew 不存在时不静默装（curl|bash 不可接受），引导用户去 brew.sh。
 @MainActor
 final class DependencyInstaller: ObservableObject {
@@ -16,7 +16,7 @@ final class DependencyInstaller: ObservableObject {
     private var process: Process?
 
     var brewAvailable: Bool { DependencySetup.brewPath() != nil }
-    var missing: [DependencySetup.Component] { components.filter { !$0.isInstalled } }
+    var missing: [DependencySetup.Component] { DependencySetup.missing(from: components) }
     var allInstalled: Bool { missing.isEmpty }
 
     func refresh() {
@@ -174,12 +174,11 @@ struct DependencySetupSheet: View {
                 Spacer()
                 Button("关闭") {
                     installer.cancel()
-                    model.showDependencySetup = false
+                    model.closeDependencySetup()
                 }
                 if installer.allInstalled {
-                    Button("完成，重新解析") {
-                        model.showDependencySetup = false
-                        model.retry()
+                    Button("完成") {
+                        model.completeDependencySetup()
                     }
                     .buttonStyle(.borderedProminent)
                 } else if installer.brewAvailable {

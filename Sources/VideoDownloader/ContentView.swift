@@ -33,7 +33,7 @@ struct ContentView: View {
             model.prefillFromClipboardIfAppropriate()
         }
         .onChange(of: model.requestUrlFocus) { urlFieldFocused = true }
-        .sheet(isPresented: $model.showSettings, onDismiss: { model.consumePendingLogin() }) {
+        .sheet(isPresented: $model.showSettings, onDismiss: { model.consumePendingSettingsActions() }) {
             SettingsView(model: model)
         }
         .sheet(isPresented: $model.showDependencySetup) {
@@ -276,7 +276,7 @@ struct ContentView: View {
                     section("字幕") {
                         subtitleRows(info)
                     }
-                    section("中文字幕") {
+                    section("字幕处理") {
                         chineseSubtitleRows(info)
                     }
                 }
@@ -416,11 +416,11 @@ struct ContentView: View {
         )
     }
 
-    /// 「中文字幕」分组：依赖上方至少勾选一条字幕；翻译服务未配置时给出入口。
+    /// 「字幕处理」分组：依赖上方至少勾选一条字幕；只有翻译类模式需要翻译服务。
     private func chineseSubtitleRows(_ info: VideoInfo) -> some View {
         let hasSubtitleSelected = !model.selectedSubtitleIDs.isEmpty
         return VStack(alignment: .leading, spacing: 8) {
-            Picker("中文字幕", selection: $model.chineseMode) {
+            Picker("字幕处理", selection: $model.chineseMode) {
                 ForEach(ChineseSubtitleMode.allCases, id: \.self) { mode in
                     Text(mode.label).tag(mode)
                 }
@@ -432,7 +432,7 @@ struct ContentView: View {
                 Text("先在上面勾选一条字幕")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else if !model.settings.isTranslationConfigured {
+            } else if model.chineseMode.requiresTranslation, !model.settings.isTranslationConfigured {
                 HStack(spacing: 8) {
                     Text("未配置翻译服务")
                         .font(.caption)
@@ -445,11 +445,13 @@ struct ContentView: View {
                 }
             } else if model.chineseMode != .off, model.selectedSubtitleIDs.count > 1,
                       let source = model.translationSourceSubtitle(in: info) {
-                Text("将翻译：\(source.label)")
+                Text(model.chineseMode == .burnOriginal
+                     ? "将烧录：\(source.label)"
+                     : "将翻译：\(source.label)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if model.chineseMode != .off, model.translationSourceIsChinese(in: info) {
+            if model.chineseMode.requiresTranslation, model.translationSourceIsChinese(in: info) {
                 Text(model.chineseMode == .burnIn
                      ? "该字幕已是中文，将直接烧录（不翻译）"
                      : "该字幕已是中文，将直接使用（不翻译）")

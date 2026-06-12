@@ -15,43 +15,54 @@ public enum DependencySetup {
         public let isInstalled: Bool
     }
 
-    /// 三件套体检。ffmpeg 与 Burner 同口径（认 keg-only 的 ffmpeg-full 或标准位置）；
+    /// 三件套体检。ffmpeg 与 Burner 同口径：必须带 subtitles/libass 渲染能力；
     /// JS 运行时 deno/node 任一即可（yt-dlp 解 YouTube n-challenge 需要）。
     public static func check() -> [Component] {
+        components(
+            ytDlpInstalled: find("yt-dlp") != nil,
+            subtitleRendererFfmpegInstalled: FFmpegBurner.locateSubtitleRendererFFmpeg() != nil,
+            jsRuntimeInstalled: find("deno") != nil || find("node") != nil
+        )
+    }
+
+    internal static func components(
+        ytDlpInstalled: Bool,
+        subtitleRendererFfmpegInstalled: Bool,
+        jsRuntimeInstalled: Bool
+    ) -> [Component] {
         [
             Component(
                 id: "yt-dlp", formula: "yt-dlp",
                 purpose: "视频解析与下载",
-                isInstalled: find("yt-dlp") != nil
+                isInstalled: ytDlpInstalled
             ),
             Component(
-                id: "ffmpeg", formula: "ffmpeg",
-                purpose: "合并、转码与字幕烧录",
-                isInstalled: ffmpegInstalled
+                id: "ffmpeg", formula: "ffmpeg-full",
+                purpose: "合并、转码与字幕烧录（需 libass）",
+                isInstalled: subtitleRendererFfmpegInstalled
             ),
             Component(
                 id: "deno", formula: "deno",
                 purpose: "YouTube 下载所需的 JS 运行时",
-                isInstalled: find("deno") != nil || find("node") != nil
+                isInstalled: jsRuntimeInstalled
             ),
         ]
     }
 
-    public static var missing: [Component] { check().filter { !$0.isInstalled } }
+    public static func missing(from components: [Component]) -> [Component] {
+        components.filter { !$0.isInstalled }
+    }
+
+    public static func needsSetup(_ components: [Component]) -> Bool {
+        !missing(from: components).isEmpty
+    }
+
+    public static var missing: [Component] { missing(from: check()) }
 
     /// Homebrew 可执行路径（Apple Silicon / Intel 双位置）。
     public static func brewPath() -> String? {
         ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
-    private static var ffmpegInstalled: Bool {
-        [
-            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
-            "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
-            "/opt/homebrew/bin/ffmpeg",
-            "/usr/local/bin/ffmpeg",
-        ].contains { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     private static func find(_ name: String) -> String? {
