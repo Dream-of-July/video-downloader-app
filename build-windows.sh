@@ -8,7 +8,7 @@ PROJ_DIR="${0:a:h}"
 WIN_DIR="$PROJ_DIR/windows"
 PUBLISH_DIR="$HOME/Library/Caches/vdl-build/win-publish"
 OUT="${1:-$HOME/Downloads/视频下载器-Windows-Setup.exe}"
-VERSION="1.1.0"
+VERSION="0.1.0"
 
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
 
