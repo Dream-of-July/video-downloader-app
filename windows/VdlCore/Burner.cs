@@ -38,22 +38,28 @@ public sealed class FFmpegBurner : ISubtitleBurner
         var ffmpeg = Locate("ffmpeg") ?? throw VdlException.BinaryNotFound("ffmpeg");
         if (control?.IsCancelled == true) throw VdlException.Cancelled();
 
-        // 1. ffprobe 取时长、整体码率与源高度（取不到不阻塞烧录，只影响进度与缩放/码率）
+        // 1. ffprobe 取时长、整体码率与源尺寸（取不到不阻塞烧录，只影响进度与缩放/码率）
         var probe = await ProbeAsync(video, ct).ConfigureAwait(false);
 
-        // 缩放目标：maxHeight 非空且源更高时缩到 maxHeight（偶数高度），否则保持源。
-        int? targetHeight = maxHeight is { } mh && mh > 0 && probe.Height is { } sourceHeight && sourceHeight > mh
+        // 「最大 1080p」语义按短边算：横屏限高、竖屏限宽。
+        // 旧规则只看高度，竖屏 1080×1920 会被压成 608×1080（短边掉到 608）。
+        var isPortrait = probe is { Width: { } pw, Height: { } ph } && pw < ph;
+        var sourceShortSide = ShortSide(probe.Width, probe.Height);
+        // 缩放目标：maxHeight 非空且源短边更大时把短边缩到 maxHeight，否则保持源。
+        int? targetShortSide = maxHeight is { } mh && mh > 0 && sourceShortSide is { } shortSide && shortSide > mh
             ? mh
             : null;
-        // -maxrate 上限：缩放后按目标高度推算；不缩放时取源整体码率，缺失再按源高度推算。
-        var maxrateK = MaxrateK(probe.BitRateBps, probe.Height, targetHeight);
+        // -maxrate 上限：缩放后按目标档位推算；不缩放时取源整体码率，缺失再按源档位推算。
+        // 档位维度同样用短边（竖屏 1080×1920 是 1080p 档，不是 4K 档）。
+        var maxrateK = MaxrateK(probe.BitRateBps, sourceShortSide, targetShortSide);
 
         // 2. 临时目录：字幕转成 subs.ass 并把 ffmpeg 工作目录设到这里，
         //    规避 subtitles 滤镜对路径里冒号/引号/中文的转义问题。
         //    用 ASS 而非 SRT 是为了双语两种字号：中文（首行）正常字号，原文（次行）更小。
         var tempDir = Path.Combine(Path.GetTempPath(), $"vdl-burn-{Guid.NewGuid():N}");
-        // 缩放滤镜：-2 让宽度自动按比例取偶数，避免 H.264 要求偶数边长报错。
-        var scaleFilter = targetHeight is { } th ? $"scale=-2:{th}" : null;
+        // 缩放滤镜：-2 让另一边自动按比例取偶数，避免 H.264 要求偶数边长报错。
+        // 横屏限高（scale=-2:H）、竖屏限宽（scale=W:-2）。
+        var scaleFilter = ScaleFilter(isPortrait, targetShortSide);
         string filter;
         try
         {
@@ -70,7 +76,11 @@ public sealed class FFmpegBurner : ISubtitleBurner
             }
             else
             {
-                var ass = MakeAss(cues);
+                // 字幕坐标系/字号按视频长宽比自适应（缩放不改变比例，用源尺寸即可）
+                var aspect = probe is { Width: { } w, Height: { } h } && w > 0 && h > 0
+                    ? (double)w / h
+                    : 16.0 / 9.0;
+                var ass = MakeAss(cues, aspect);
                 await File.WriteAllTextAsync(Path.Combine(tempDir, "subs.ass"), ass, ct).ConfigureAwait(false);
                 subtitleFilter = "subtitles=subs.ass";
             }
@@ -226,12 +236,12 @@ public sealed class FFmpegBurner : ISubtitleBurner
 
     // MARK: ffprobe
 
-    internal sealed record ProbeResult(double? Duration, double? BitRateBps, int? Height);
+    internal sealed record ProbeResult(double? Duration, double? BitRateBps, int? Width, int? Height);
 
     private static async Task<ProbeResult> ProbeAsync(string video, CancellationToken ct)
     {
         var ffprobe = Locate("ffprobe");
-        if (ffprobe is null) return new ProbeResult(null, null, null);
+        if (ffprobe is null) return new ProbeResult(null, null, null, null);
         var lines = new List<string>();
         var linesLock = new object();
         int status;
@@ -245,9 +255,9 @@ public sealed class FFmpegBurner : ISubtitleBurner
         }
         catch (VdlException)
         {
-            return new ProbeResult(null, null, null);
+            return new ProbeResult(null, null, null, null);
         }
-        if (status != 0) return new ProbeResult(null, null, null);
+        if (status != 0) return new ProbeResult(null, null, null, null);
         string text;
         lock (linesLock) text = string.Join("\n", lines);
         try
@@ -255,7 +265,7 @@ public sealed class FFmpegBurner : ISubtitleBurner
             using var doc = JsonDocument.Parse(text);
             var root = doc.RootElement;
             double? duration = null, bitRate = null;
-            int? height = null;
+            int? width = null, height = null;
             if (root.TryGetProperty("format", out var format) && format.ValueKind == JsonValueKind.Object)
             {
                 duration = YtDlpEngine.DoubleField(format, "duration");
@@ -266,20 +276,29 @@ public sealed class FFmpegBurner : ISubtitleBurner
                 foreach (var stream in streams.EnumerateArray())
                 {
                     if (YtDlpEngine.StringField(stream, "codec_type") != "video") continue;
+                    width = YtDlpEngine.IntField(stream, "width");
                     height = YtDlpEngine.IntField(stream, "height");
                     bitRate ??= YtDlpEngine.DoubleField(stream, "bit_rate");
                     break;
                 }
             }
-            return new ProbeResult(duration, bitRate, height);
+            return new ProbeResult(duration, bitRate, width, height);
         }
         catch (JsonException)
         {
-            return new ProbeResult(null, null, null);
+            return new ProbeResult(null, null, null, null);
         }
     }
 
     // MARK: 进度与参数
+
+    /// <summary>源短边：缩放上限与码率档位都按短边算（竖屏 1080×1920 视作 1080p）。</summary>
+    internal static int? ShortSide(int? width, int? height) =>
+        height is { } h ? (width is { } w ? Math.Min(w, h) : h) : width;
+
+    /// <summary>缩放滤镜：横屏限高（scale=-2:H）、竖屏限宽（scale=W:-2）；目标为空不缩放。</summary>
+    internal static string? ScaleFilter(bool isPortrait, int? targetShortSide) =>
+        targetShortSide is { } th ? (isPortrait ? $"scale={th}:-2" : $"scale=-2:{th}") : null;
 
     /// <summary>
     /// 计算 -maxrate 的 k 值（CRF 编码下仅作封顶，防高复杂度片段码率失控、体积膨胀）。
@@ -338,19 +357,62 @@ public sealed class FFmpegBurner : ISubtitleBurner
         return last.Length > 200 ? last[..200] : last;
     }
 
-    // MARK: ASS 生成（双语两级字号）
+    // MARK: ASS 生成（双语两级字号，按视频长宽比自适应）
 
     private const int ChineseFontSize = 15;
     private const int OriginalFontSize = 11;
 
     /// <summary>
+    /// 按视频长宽比推导的 ASS 布局参数。
+    /// 字号历来按「高度的固定比例」调校（横屏 16:9 下 15/288≈5.2% 视频高），
+    /// 竖屏时宽度变窄、同比例字号一行只装得下十来个字还会顶边。
+    /// 竖屏改按 sqrt(aspect / (16/9)) 缩小字号——高度占比与每行字数的折中
+    /// （纯按宽度缩会太小，不缩会溢出），9:16 时中文一行约 19 字。
+    /// </summary>
+    internal readonly struct AssLayout
+    {
+        public int PlayResX { get; }
+        public int PlayResY => 288;
+        public int ChineseSize { get; }
+        public int OriginalSize { get; }
+        public int MarginH { get; }
+        public int MarginV => 20;
+        /// <summary>中文行预换行容量（字符数）；null 表示不预换行（交给 libass）。</summary>
+        public int? CjkWrapCapacity { get; }
+
+        public AssLayout(double aspect)
+        {
+            var safeAspect = double.IsFinite(aspect) && aspect > 0.1 ? Math.Min(aspect, 4.0) : 16.0 / 9.0;
+            // 脚本坐标系与视频同比例（取偶数），横向边距/字号的单位才不会被拉伸
+            PlayResX = Math.Max(120, (int)Math.Round(288.0 * safeAspect / 2, MidpointRounding.AwayFromZero) * 2);
+            if (safeAspect >= 1)
+            {
+                ChineseSize = ChineseFontSize;
+                OriginalSize = OriginalFontSize;
+            }
+            else
+            {
+                var scale = Math.Sqrt(safeAspect / (16.0 / 9.0));
+                ChineseSize = Math.Max(8, (int)Math.Round(ChineseFontSize * scale, MidpointRounding.AwayFromZero));
+                OriginalSize = Math.Max(6, (int)Math.Round(OriginalFontSize * scale, MidpointRounding.AwayFromZero));
+            }
+            MarginH = Math.Max(5, (int)Math.Round(PlayResX * 0.03, MidpointRounding.AwayFromZero));
+            // 中文无空格，部分 libass 构建只在空格处断行，长行会横向溢出；
+            // 一律自己按容量预换行（同时把行切得均衡，避免「一长一短」的难看断行）。
+            var capacity = (PlayResX - MarginH * 2) / Math.Max(ChineseSize, 1);
+            CjkWrapCapacity = capacity >= 6 ? capacity : null;
+        }
+    }
+
+    /// <summary>
     /// 把 SRT 字幕转成 ASS：双语条目（含中日韩文字的行 + 不含的行）中日韩行用正常字号排上面，
     /// 其余行（原文）用更小字号排下面；普通条目整条统一字号。
-    /// fontName 供测试注入；null 用平台默认。
+    /// aspect = 视频宽/高；fontName 供测试注入，null 用平台默认。
     /// </summary>
-    internal static string MakeAss(IReadOnlyList<SubtitleCue> cues, string? fontName = null)
+    internal static string MakeAss(IReadOnlyList<SubtitleCue> cues, double aspect = 16.0 / 9.0, string? fontName = null)
     {
         var font = fontName ?? ChineseFontName;
+        var layout = new AssLayout(aspect);
         var dialogues = new List<string>();
         foreach (var cue in cues)
         {
@@ -366,17 +428,24 @@ public sealed class FFmpegBurner : ISubtitleBurner
             // 双语条目：含中日韩文字的行排上面（正常字号），其余原文行排下面（小字号）。
             // 不论源文件里两种语言的顺序如何，烧录出来都是中文在上。
             string text;
-            var cjkLines = lines.Where(ContainsCjk).ToList();
+            var cjkLines = new List<string>();
+            foreach (var cjk in lines.Where(ContainsCjk))
+            {
+                if (layout.CjkWrapCapacity is { } capacity) cjkLines.AddRange(WrapCjkLine(cjk, capacity));
+                else cjkLines.Add(cjk);
+            }
             var otherLines = lines.Where(l => !ContainsCjk(l)).ToList();
             if (cjkLines.Count > 0 && otherLines.Count > 0)
             {
                 text = string.Join("\\N", cjkLines)
-                    + $"\\N{{\\fs{OriginalFontSize}}}"
+                    + $"\\N{{\\fs{layout.OriginalSize}}}"
                     + string.Join("\\N", otherLines);
             }
             else
             {
-                text = string.Join("\\N", lines);
+                text = cjkLines.Count == 0
+                    ? string.Join("\\N", lines)
+                    : string.Join("\\N", cjkLines);
             }
             dialogues.Add($"Dialogue: 0,{start},{end},ZH,,0,0,0,,{text}");
         }
@@ -384,20 +453,67 @@ public sealed class FFmpegBurner : ISubtitleBurner
         var header = $"""
             [Script Info]
             ScriptType: v4.00+
-            PlayResX: 384
-            PlayResY: 288
+            PlayResX: {layout.PlayResX}
+            PlayResY: {layout.PlayResY}
             WrapStyle: 0
             ScaledBorderAndShadow: yes
 
             [V4+ Styles]
             Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-            Style: ZH,{font},{ChineseFontSize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,1,0,2,12,12,20,1
+            Style: ZH,{font},{layout.ChineseSize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,1,0,2,{layout.MarginH},{layout.MarginH},{layout.MarginV},1
 
             [Events]
             Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             """;
         return header + "\n" + string.Join("\n", dialogues) + "\n";
     }
+
+    /// <summary>
+    /// 超过容量的中文行均衡预换行：行数取最少、各行长度尽量接近；
+    /// 切点优先标点之后 &gt; 空格处 &gt; 任意中日韩字界（绝不切进英文单词/数字中间）。
+    /// </summary>
+    internal static List<string> WrapCjkLine(string line, int capacity)
+    {
+        var chars = line.ToCharArray();
+        if (capacity < 6 || chars.Length <= capacity) return [line];
+        var lineCount = (int)Math.Ceiling((double)chars.Length / capacity);
+        var target = (int)Math.Ceiling((double)chars.Length / lineCount);
+        var result = new List<string>();
+        var start = 0;
+        while (chars.Length - start > capacity)
+        {
+            var idealEnd = Math.Min(start + target, chars.Length - 1);
+            // 在理想切点前后各 6 个字符内找切点（切点 = 新行的起点下标），
+            // 上限不超过容量保证本行装得下；同级里取离理想点最近的。
+            var low = Math.Max(start + 1, idealEnd - 6);
+            var high = Math.Min(start + capacity, Math.Min(idealEnd + 6, chars.Length - 1));
+            int? bestPunct = null, bestSpace = null, bestCjkBoundary = null;
+            int Better(int? current, int candidate) =>
+                current is { } cur && Math.Abs(candidate - idealEnd) >= Math.Abs(cur - idealEnd)
+                    ? cur
+                    : candidate;
+            for (var i = low; i <= high; i++)
+            {
+                var prev = chars[i - 1];
+                if (CjkBreakAfter.Contains(prev)) bestPunct = Better(bestPunct, i);
+                else if (prev == ' ' || chars[i] == ' ') bestSpace = Better(bestSpace, i);
+                else if (IsCjkChar(prev) || IsCjkChar(chars[i])) bestCjkBoundary = Better(bestCjkBoundary, i);
+            }
+            var cut = bestPunct ?? bestSpace ?? bestCjkBoundary ?? idealEnd;
+            var piece = new string(chars, start, cut - start).Trim();
+            if (piece.Length > 0) result.Add(piece);
+            start = cut;
+            // 跳过切点处的空格，避免新行以空格开头
+            while (start < chars.Length && chars[start] == ' ') start++;
+        }
+        var last = new string(chars, start, chars.Length - start).Trim();
+        if (last.Length > 0) result.Add(last);
+        return result.Count == 0 ? [line] : result;
+    }
+
+    /// <summary>切行时允许出现在行尾的标点（其后断行不破坏语感）。</summary>
+    private static readonly HashSet<char> CjkBreakAfter =
+        ['，', '。', '！', '？', '、', '；', '：', '…', ',', '.', '!', '?', ';', ':'];
 
     /// <summary>"00:01:02,500" → "0:01:02.50"（ASS 用厘秒）。</summary>
     internal static string? AssTimestamp(string srt)
@@ -422,6 +538,13 @@ public sealed class FFmpegBurner : ISubtitleBurner
                 or >= 0x3400 and <= 0x4DBF               // 扩展 A
                 or >= 0x3040 and <= 0x30FF               // 日文假名
                 or >= 0xAC00 and <= 0xD7AF);             // 谚文
+
+    /// <summary>切行用的单字符判定；四个区段都在 BMP，按 char 比较即可（与 ContainsCjk 同区段）。</summary>
+    private static bool IsCjkChar(char c) =>
+        (int)c is >= 0x4E00 and <= 0x9FFF        // CJK 统一表意
+            or >= 0x3400 and <= 0x4DBF           // 扩展 A
+            or >= 0x3040 and <= 0x30FF           // 日文假名
+            or >= 0xAC00 and <= 0xD7AF;          // 谚文
 
     /// <summary>ASS 文本里 {} 是样式覆盖块定界符，替换为全角避免被解析。</summary>
     internal static string EscapeAssText(string line) =>
