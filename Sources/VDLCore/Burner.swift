@@ -81,20 +81,32 @@ public struct FFmpegBurner: SubtitleBurner {
         }
         if control?.isCancelled == true { throw VDLError.cancelled }
 
-        // 1. ffprobe 取时长、整体码率与源高度（取不到不阻塞烧录，只影响进度与缩放/码率）
+        // 1. ffprobe 取时长、整体码率与源尺寸（取不到不阻塞烧录，只影响进度与缩放/码率）
         let probe = await Self.probe(video: video)
 
-        // 缩放目标：maxHeight 非空且源更高时缩到 maxHeight（偶数高度），否则保持源。
-        let targetHeight: Int? = {
-            guard let maxHeight, maxHeight > 0, let sourceHeight = probe.height,
-                  sourceHeight > maxHeight else { return nil }
+        // 「最大 1080p」语义按短边算：横屏限高、竖屏限宽。
+        // 旧规则只看高度，竖屏 1080×1920 会被压成 608×1080（短边掉到 608）。
+        let isPortrait: Bool = {
+            guard let w = probe.width, let h = probe.height else { return false }
+            return w < h
+        }()
+        let sourceShortSide: Int? = {
+            guard let h = probe.height else { return probe.width }
+            guard let w = probe.width else { return h }
+            return min(w, h)
+        }()
+        // 缩放目标：maxHeight 非空且源短边更大时把短边缩到 maxHeight，否则保持源。
+        let targetShortSide: Int? = {
+            guard let maxHeight, maxHeight > 0, let short = sourceShortSide,
+                  short > maxHeight else { return nil }
             return maxHeight
         }()
-        // -maxrate 上限：缩放后按目标高度推算；不缩放时取源整体码率，缺失再按源高度推算。
+        // -maxrate 上限：缩放后按目标档位推算；不缩放时取源整体码率，缺失再按源档位推算。
+        // 档位维度同样用短边（竖屏 1080×1920 是 1080p 档，不是 4K 档）。
         let maxrateK = Self.maxrateK(
             sourceBitRateBPS: probe.bitRateBPS,
-            sourceHeight: probe.height,
-            targetHeight: targetHeight
+            sourceHeight: sourceShortSide,
+            targetHeight: targetShortSide
         )
 
         // 2. 临时目录：字幕转成 subs.ass 并把 ffmpeg 工作目录设到这里，
@@ -103,8 +115,9 @@ public struct FFmpegBurner: SubtitleBurner {
         let fm = FileManager.default
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("vdl-burn-\(UUID().uuidString)", isDirectory: true)
-        // 缩放滤镜：-2 让宽度自动按比例取偶数，避免 H.264 要求偶数边长报错。
-        let scaleFilter = targetHeight.map { "scale=-2:\($0)" }
+        // 缩放滤镜：-2 让另一边自动按比例取偶数，避免 H.264 要求偶数边长报错。
+        // 横屏限高（scale=-2:H）、竖屏限宽（scale=W:-2）。
+        let scaleFilter = targetShortSide.map { isPortrait ? "scale=\($0):-2" : "scale=-2:\($0)" }
         let filter: String
         do {
             try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -117,7 +130,14 @@ public struct FFmpegBurner: SubtitleBurner {
                 subtitleFilter = "subtitles=subs.srt:force_style="
                     + "'FontName=\(Self.chineseFontName),FontSize=15,Outline=1,Shadow=0,MarginV=20'"
             } else {
-                let ass = Self.makeASS(cues: cues)
+                // 字幕坐标系/字号按视频长宽比自适应（缩放不改变比例，用源尺寸即可）
+                let aspect: Double = {
+                    guard let w = probe.width, let h = probe.height, w > 0, h > 0 else {
+                        return 16.0 / 9.0
+                    }
+                    return Double(w) / Double(h)
+                }()
+                let ass = Self.makeASS(cues: cues, aspect: aspect)
                 try ass.write(
                     to: tempDir.appendingPathComponent("subs.ass"),
                     atomically: true, encoding: .utf8
@@ -241,6 +261,7 @@ public struct FFmpegBurner: SubtitleBurner {
     private struct ProbeResult {
         var duration: Double?
         var bitRateBPS: Double?
+        var width: Int?
         var height: Int?
     }
 
@@ -280,6 +301,7 @@ public struct FFmpegBurner: SubtitleBurner {
         }
         if let streams = dict["streams"] as? [[String: Any]],
            let videoStream = streams.first(where: { ($0["codec_type"] as? String) == "video" }) {
+            result.width = int(videoStream["width"])
             result.height = int(videoStream["height"])
             if result.bitRateBPS == nil {
                 result.bitRateBPS = double(videoStream["bit_rate"])
@@ -355,14 +377,53 @@ public struct FFmpegBurner: SubtitleBurner {
         return String((lines.last ?? "未知错误").prefix(200))
     }
 
-    // MARK: ASS 生成（双语两级字号）
+    // MARK: ASS 生成（双语两级字号，按视频长宽比自适应）
 
     private static let chineseFontSize = 15
     private static let originalFontSize = 11
 
+    /// 按视频长宽比推导的 ASS 布局参数。
+    /// 字号历来按「高度的固定比例」调校（横屏 16:9 下 15/288≈5.2% 视频高），
+    /// 竖屏时宽度变窄、同比例字号一行只装得下十来个字还会顶边。
+    /// 竖屏改按 sqrt(aspect / (16/9)) 缩小字号——高度占比与每行字数的折中
+    ///（纯按宽度缩会太小，不缩会溢出），9:16 时中文一行约 19 字。
+    struct ASSLayout: Equatable {
+        let playResX: Int
+        let playResY = 288
+        let chineseSize: Int
+        let originalSize: Int
+        let marginH: Int
+        let marginV = 20
+        /// 中文行预换行容量（字符数）；nil 表示不预换行（交给 libass）。
+        let cjkWrapCapacity: Int?
+
+        init(aspect: Double) {
+            let safeAspect = aspect.isFinite && aspect > 0.1 ? min(aspect, 4.0) : 16.0 / 9.0
+            // 脚本坐标系与视频同比例（取偶数），横向边距/字号的单位才不会被拉伸
+            playResX = max(120, Int((288.0 * safeAspect / 2).rounded()) * 2)
+            if safeAspect >= 1 {
+                chineseSize = Self.baseChinese
+                originalSize = Self.baseOriginal
+            } else {
+                let scale = (safeAspect / (16.0 / 9.0)).squareRoot()
+                chineseSize = max(8, Int((Double(Self.baseChinese) * scale).rounded()))
+                originalSize = max(6, Int((Double(Self.baseOriginal) * scale).rounded()))
+            }
+            marginH = max(5, Int((Double(playResX) * 0.03).rounded()))
+            // 中文无空格，部分 libass 构建只在空格处断行，长行会横向溢出；
+            // 一律自己按容量预换行（同时把行切得均衡，避免「一长一短」的难看断行）。
+            let capacity = (playResX - marginH * 2) / max(chineseSize, 1)
+            cjkWrapCapacity = capacity >= 6 ? capacity : nil
+        }
+
+        private static let baseChinese = FFmpegBurner.chineseFontSize
+        private static let baseOriginal = FFmpegBurner.originalFontSize
+    }
+
     /// 把 SRT 字幕转成 ASS：双语条目（首行含中日韩文字、其余行不含）首行用正常字号，
-    /// 其余行（原文）用更小字号；普通条目整条统一字号。
-    static func makeASS(cues: [SubtitleCue]) -> String {
+    /// 其余行（原文）用更小字号；普通条目整条统一字号。aspect = 视频宽/高。
+    static func makeASS(cues: [SubtitleCue], aspect: Double = 16.0 / 9.0) -> String {
+        let layout = ASSLayout(aspect: aspect)
         var dialogues: [String] = []
         for cue in cues {
             guard let start = assTimestamp(cue.start), let end = assTimestamp(cue.end) else {
@@ -378,13 +439,19 @@ public struct FFmpegBurner: SubtitleBurner {
             // 不论源文件里两种语言的顺序如何，烧录出来都是中文在上。
             let text: String
             let cjkLines = lines.filter(Self.containsCJK)
+                .flatMap { line -> [String] in
+                    guard let capacity = layout.cjkWrapCapacity else { return [line] }
+                    return wrapCJKLine(line, capacity: capacity)
+                }
             let otherLines = lines.filter { !Self.containsCJK($0) }
             if !cjkLines.isEmpty, !otherLines.isEmpty {
                 text = cjkLines.joined(separator: "\\N")
-                    + "\\N{\\fs\(originalFontSize)}"
+                    + "\\N{\\fs\(layout.originalSize)}"
                     + otherLines.joined(separator: "\\N")
             } else {
-                text = lines.joined(separator: "\\N")
+                text = cjkLines.isEmpty
+                    ? lines.joined(separator: "\\N")
+                    : cjkLines.joined(separator: "\\N")
             }
             dialogues.append("Dialogue: 0,\(start),\(end),ZH,,0,0,0,,\(text)")
         }
@@ -392,20 +459,69 @@ public struct FFmpegBurner: SubtitleBurner {
         let header = """
         [Script Info]
         ScriptType: v4.00+
-        PlayResX: 384
-        PlayResY: 288
+        PlayResX: \(layout.playResX)
+        PlayResY: \(layout.playResY)
         WrapStyle: 0
         ScaledBorderAndShadow: yes
 
         [V4+ Styles]
         Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-        Style: ZH,\(chineseFontName),\(chineseFontSize),&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,1,0,2,12,12,20,1
+        Style: ZH,\(chineseFontName),\(layout.chineseSize),&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,1,0,2,\(layout.marginH),\(layout.marginH),\(layout.marginV),1
 
         [Events]
         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         """
         return header + "\n" + dialogues.joined(separator: "\n") + "\n"
     }
+
+    /// 超过容量的中文行均衡预换行：行数取最少、各行长度尽量接近；
+    /// 切点优先标点之后 > 空格处 > 任意中日韩字界（绝不切进英文单词/数字中间）。
+    static func wrapCJKLine(_ line: String, capacity: Int) -> [String] {
+        let chars = Array(line)
+        guard capacity >= 6, chars.count > capacity else { return [line] }
+        let lineCount = Int((Double(chars.count) / Double(capacity)).rounded(.up))
+        let target = Int((Double(chars.count) / Double(lineCount)).rounded(.up))
+        var result: [String] = []
+        var start = 0
+        while chars.count - start > capacity {
+            let idealEnd = min(start + target, chars.count - 1)
+            // 在理想切点前后各 6 个字符内找切点（切点 = 新行的起点下标），
+            // 上限不超过容量保证本行装得下；同级里取离理想点最近的。
+            let low = max(start + 1, idealEnd - 6)
+            let high = min(start + capacity, min(idealEnd + 6, chars.count - 1))
+            var bestPunct: Int?
+            var bestSpace: Int?
+            var bestCJKBoundary: Int?
+            func better(_ current: Int?, _ candidate: Int) -> Int {
+                guard let current else { return candidate }
+                return abs(candidate - idealEnd) < abs(current - idealEnd) ? candidate : current
+            }
+            for i in low...high {
+                let prev = chars[i - 1]
+                if Self.cjkBreakAfter.contains(prev) {
+                    bestPunct = better(bestPunct, i)
+                } else if prev == " " || chars[i] == " " {
+                    bestSpace = better(bestSpace, i)
+                } else if isCJKChar(prev) || isCJKChar(chars[i]) {
+                    bestCJKBoundary = better(bestCJKBoundary, i)
+                }
+            }
+            let cut = bestPunct ?? bestSpace ?? bestCJKBoundary ?? idealEnd
+            let piece = String(chars[start..<cut]).trimmingCharacters(in: .whitespaces)
+            if !piece.isEmpty { result.append(piece) }
+            start = cut
+            // 跳过切点处的空格，避免新行以空格开头
+            while start < chars.count, chars[start] == " " { start += 1 }
+        }
+        let last = String(chars[start...]).trimmingCharacters(in: .whitespaces)
+        if !last.isEmpty { result.append(last) }
+        return result.isEmpty ? [line] : result
+    }
+
+    /// 切行时允许出现在行尾的标点（其后断行不破坏语感）。
+    private static let cjkBreakAfter: Set<Character> = [
+        "，", "。", "！", "？", "、", "；", "：", "…", ",", ".", "!", "?", ";", ":",
+    ]
 
     /// "00:01:02,500" → "0:01:02.50"（ASS 用厘秒）
     private static func assTimestamp(_ srt: String) -> String? {
@@ -422,12 +538,18 @@ public struct FFmpegBurner: SubtitleBurner {
     }
 
     private static func containsCJK(_ text: String) -> Bool {
-        text.unicodeScalars.contains { scalar in
-            (0x4E00...0x9FFF).contains(scalar.value)        // CJK 统一表意
-                || (0x3400...0x4DBF).contains(scalar.value) // 扩展 A
-                || (0x3040...0x30FF).contains(scalar.value) // 日文假名
-                || (0xAC00...0xD7AF).contains(scalar.value) // 谚文
-        }
+        text.unicodeScalars.contains(where: isCJKScalar)
+    }
+
+    private static func isCJKChar(_ character: Character) -> Bool {
+        character.unicodeScalars.contains(where: isCJKScalar)
+    }
+
+    private static func isCJKScalar(_ scalar: Unicode.Scalar) -> Bool {
+        (0x4E00...0x9FFF).contains(scalar.value)        // CJK 统一表意
+            || (0x3400...0x4DBF).contains(scalar.value) // 扩展 A
+            || (0x3040...0x30FF).contains(scalar.value) // 日文假名
+            || (0xAC00...0xD7AF).contains(scalar.value) // 谚文
     }
 
     /// ASS 文本里 {} 是样式覆盖块定界符，替换为全角避免被解析
