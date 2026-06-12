@@ -56,11 +56,16 @@ jobs:
           if (-not (Test-Path $makensis)) {
             $makensis = "${env:ProgramFiles}\NSIS\makensis.exe"
           }
-          & $makensis /INPUTCHARSET UTF8 `
-            "/DPUBLISH_DIR=$publishDir" `
-            "/DOUTFILE=$outFile" `
-            "/DAPPVERSION=${{ inputs.version }}" `
-            "windows\installer\installer.nsi"
+          Push-Location windows\installer
+          try {
+            & $makensis /INPUTCHARSET UTF8 `
+              "/DPUBLISH_DIR=$publishDir" `
+              "/DOUTFILE=$outFile" `
+              "/DAPPVERSION=${{ inputs.version }}" `
+              "installer.nsi"
+          } finally {
+            Pop-Location
+          }
 
       - name: Upload installer to release
         shell: pwsh
