@@ -73,3 +73,7 @@ Windows 有独立的原生实现（`windows/`：C# 核心库 + WPF 图形界面 
 - 首次写入 `~/Downloads` 时 macOS 会弹一次系统授权询问，允许即可。
 - 仅下载你有权访问的公开视频；不绕过任何 DRM 或付费墙。
 - 任天堂 `assets.nintendo.com` 直链视频只有原画一档（其 CDN 已禁用转码变体）。
+
+## License
+
+MIT
