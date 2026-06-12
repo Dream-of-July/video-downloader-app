@@ -1,0 +1,71 @@
+name: Build Windows release asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to upload to
+        required: true
+        default: v0.1.0
+      version:
+        description: App version
+        required: true
+        default: 0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Run Windows core tests
+        run: dotnet test windows/VideoDownloader.Win.sln --nologo -v minimal
+
+      - name: Publish self-contained app
+        shell: pwsh
+        run: |
+          $publishDir = Join-Path $env:RUNNER_TEMP "win-publish"
+          dotnet publish windows/VdlApp/VdlApp.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:EnableWindowsTargeting=true `
+            -p:Version="${{ inputs.version }}" `
+            -o $publishDir `
+            --nologo
+
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $publishDir = Join-Path $env:RUNNER_TEMP "win-publish"
+          $outFile = Join-Path $env:RUNNER_TEMP "video-downloader-v${{ inputs.version }}-Windows-Setup.exe"
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) {
+            $makensis = "${env:ProgramFiles}\NSIS\makensis.exe"
+          }
+          & $makensis /INPUTCHARSET UTF8 `
+            "/DPUBLISH_DIR=$publishDir" `
+            "/DOUTFILE=$outFile" `
+            "/DAPPVERSION=${{ inputs.version }}" `
+            "windows\installer\installer.nsi"
+
+      - name: Upload installer to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $outFile = Join-Path $env:RUNNER_TEMP "video-downloader-v${{ inputs.version }}-Windows-Setup.exe"
+          gh release upload "${{ inputs.tag }}" $outFile --repo "${{ github.repository }}" --clobber
